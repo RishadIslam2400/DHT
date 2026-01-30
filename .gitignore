@@ -1,0 +1,12 @@
+# Ignore build artifacts
+build/
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Ignore IDE settings
+.vscode/
+.idea/
+.DS_Store
