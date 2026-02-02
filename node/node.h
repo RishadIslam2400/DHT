@@ -167,7 +167,7 @@ public:
     }
 
     static std::string send_to_1895(const std::string& ip, const std::string& message) {
-        return send_request_raw(ip, PEER_PORT, message);
+        return send_request_raw(ip, peer_port, message);
     }
 
     static std::string send_request_raw(const std::string& ip, int target_port, const std::string& message) {
