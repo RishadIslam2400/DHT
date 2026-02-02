@@ -21,11 +21,11 @@ int main(int argc, char** argv) {
 
     // Test Communication
     std::cout << "Sending SET 100 500 to " << target_ip << "..." << std::endl;
-    std::string response = DHTNode::send_to_1895(target_ip, "SET 100 500");
+    std::string response = DHTNode::send_request(target_ip, "SET 100 500", 1895);
     std::cout << "Response: " << response << std::endl;
 
     std::cout << "Sending GET 100 to " << target_ip << "..." << std::endl;
-    response = DHTNode::send_to_1895(target_ip, "GET 100");
+    response = DHTNode::send_request(target_ip, "GET 100", 1895);
     std::cout << "Response: " << response << std::endl;
 
     std::cout << "\nNode is running. Press [Enter] to stop.\n";

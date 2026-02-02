@@ -6,35 +6,43 @@
 #include <vector>
 #include <atomic>
 #include <sstream>
+#include <map>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
 #include <arpa/inet.h>
-#include <errno.h>
 
 #include "../concurrent_hash_table/striped_lock_concurrent_hash_table.h"
+#include "../common/MurmurHash3.h"
 
 /**
- * In a peer-to-peer (P2P) Distributed Hash Table, every node must act as both a Server and a Client simultaneously.
- * Server Thread: Listens on a specific port to accept incoming requests from other nodes.
- * Client: Connects to other nodes to forward requests or retrieve data.
- * 
- * insert: SET key value
- * search: GET key
- * delete: DEL key
+ * The network topology has a ring structure. It is a sorted list (or map) of Node IDs.
+ * Nodes are hashed onto the ring based on their ID (e.g., IP).
+ * When a key comes in, we hash it.
+ * We then scan the ring clockwise to find the first node that is >= to the key's hash.
+ * That node is the owner.
  */
 
-class DHTNode {
+struct NodeInfo {
+    std::string ip;
+    bool operator==(const NodeInfo& other) const { return ip == other.ip; }
+    bool operator!=(const NodeInfo& other) const { return ip != other.ip; }
+};
+
+
+class ConsistentHashingDHTNode {
 private:
     StripedLockConcurrentHashTable<int, int> storage;
 
-    // networking
-    int port;
+    std::map<uint64_t, NodeInfo> ring;
+    mutable std::shared_mutex ring_mutex;
+    NodeInfo self_info;
+
     int server_fd;
+    int server_port;
     std::atomic<bool> running;
     std::thread listener_thread;
-
     std::vector<std::thread> client_threads;
     std::mutex thread_mutex;
 
@@ -43,37 +51,54 @@ private:
         std::cerr << "[Error] " << prefix << " " << strerror_r(err, buf, sizeof(buf)) << std::endl;
     }
 
-    // Parse a raw string command
-    std::string handle_client_request(const std::string& request) {
+    uint64_t hash_key(const std::string& key) {
+        uint64_t hash_out[2];
+        MurmurHash3_x86_128(key.c_str(), key.length(), 2400, hash_out);
+        return hash_out[0];
+    }
+
+    uint64_t hash_key(int key) {
+        return hash_key(std::to_string(key));
+    }
+
+    NodeInfo find_successor(uint64_t key_hash) {
+        std::shared_lock<std::shared_mutex> lock(ring_mutex);
+        if (ring.empty()) return self_info;
+
+        auto it = ring.lower_bound(key_hash);
+        if (it == ring.end()) {
+            return ring.begin()->second; // Wrap around
+        }
+        return it->second;
+    }
+
+    std::string handle_request(const std::string& request) {
         std::stringstream ss(request);
         std::string command;
         int key, value;
         ss >> command;
 
-        if (command == "SET") {
+        if (command == "SET_LOCAL") {
             if (ss >> key >> value) {
                 storage.insert(key, value);
-                return "OK\n";
-            } else {
-                return "ERROR: Invalid Format\n";
+                return "Stored Locally\n";
             }
-        } else if (command == "GET") {
+        } else if (command == "GET_LOCAL") {
             if (ss >> key) {
                 auto result = storage.search(key);
-                if (result.has_value()) {
-                    return std::to_string(result.value()) + "\n";
-                } else {
-                    return "NOT FOUND\n";
-                }
+                return result.has_value() ? std::to_string(result.value()) + "\n" : "NOT FOUND\n";
             }
-        } else if (command == "DEL") {
-            if (ss >> key) {
-                storage.remove(key);
-                return "OK\n";
-            }
+        } else if (command == "PUT") {
+            if (ss >> key >> value) return put(key, value);
+        } else if (command == "GET") {
+            if (ss >> key) return get(key);
+        } else if (command == "JOIN_REQ") {
+            std::string new_ip;
+            ss >> new_ip;
+            add_node_to_ring(new_ip); // This acquires Write Lock internally
+            return "JOIN_ACK\n";
         }
-
-        return "ERROR: Unknown Command or Bad Format\n";
+        return "ERROR\n";
     }
 
     void listen_loop() {
@@ -81,7 +106,7 @@ private:
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
         server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        server_addr.sin_port = htons(port);
+        server_addr.sin_port = htons(server_port);
 
         // create socket
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -112,7 +137,7 @@ private:
             return;
         }
 
-        std::cout << "Node listening on port " << port << "..." << std::endl;
+        std::cout << "Node listening on port " << server_port << "..." << std::endl;
 
         while (running) {
             sockaddr_in client_addr;
@@ -133,7 +158,7 @@ private:
                     char buffer[1024] = {0};
                     int valread = read(new_socket, buffer, 1024);
                     if (valread > 0) {
-                        std::string response = handle_client_request(std::string(buffer));
+                        std::string response = handle_request(std::string(buffer));
                         send(new_socket, response.c_str(), response.length(), 0);
                     }
                     close(new_socket);
@@ -143,14 +168,18 @@ private:
     }
 
 public:
-    DHTNode(int p = 1895) : port(p), running(false) {}
-    ~DHTNode() {
+    ConsistentHashingDHTNode(std::string ip, int p = 1895) : running(false), server_port(p) {
+        self_info = {ip};
+        add_node_to_ring(ip); 
+    }
+
+    ~ConsistentHashingDHTNode() {
         stop();
     }
 
     void start() {
         running = true;
-        listener_thread = std::thread(&DHTNode::listen_loop, this);
+        listener_thread = std::thread(&ConsistentHashingDHTNode::listen_loop, this);
     }
 
     void stop() {
@@ -161,6 +190,44 @@ public:
         std::lock_guard<std::mutex> lock(thread_mutex);
         for (auto& t : client_threads) {
             if (t.joinable()) t.join();
+        }
+    }
+
+    void add_node_to_ring(const std::string& ip) {
+        std::unique_lock<std::shared_mutex> lock(ring_mutex); // Write Lock
+        uint64_t hash_val = hash_key(ip);
+        ring[hash_val] = {ip};
+        std::cout << "[Ring] Added " << ip << " at hash " << hash_val << "\n";
+    }
+
+    void send_join_request(const std::string& peer_ip) {
+        add_node_to_ring(peer_ip);
+        std::string msg = "JOIN_REQ " + self_info.ip;
+        send_request(peer_ip, msg);
+    }
+
+    std::string put(int key, int value) {
+        uint64_t key_hash = hash_key(key);
+        NodeInfo owner = find_successor(key_hash);
+
+        if (owner == self_info) {
+            storage.insert(key, value);
+            return "OK (stored locally)\n";
+        } else {
+            std::string msg = "SET_LOCAL " + std::to_string(key) + " " + std::to_string(value);
+            return send_request(owner.ip, msg);
+        }
+    }
+
+    std::string get(int key) {
+        uint64_t key_hash = hash_key(key);
+        NodeInfo owner = find_successor(key_hash);
+
+        if (owner == self_info) {
+            auto res = storage.search(key);
+            return res.has_value() ? std::to_string(res.value()) + "\n" : "NOT FOUND\n";
+        } else {
+            return send_request(owner.ip, "GET_LOCAL " + std::to_string(key));
         }
     }
 
@@ -194,5 +261,14 @@ public:
 
     void print_status() {
         storage.print_table();
+    }
+
+    void print_ring() {
+        std::shared_lock<std::shared_mutex> lock(ring_mutex);
+        std::cout << "Ring Topology\n";
+        for (auto &[hash, node] : ring) {
+            std::cout << hash << " -> " << node.ip << (node == self_info ? " (SELF)" : "") << "\n";
+        }
+        std::cout << "\n";
     }
 };
