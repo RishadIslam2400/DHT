@@ -68,10 +68,10 @@ int main(int argc, char **argv) {
     arg_t args;
     parse_args(argc, argv, args);
 
-    /* if (args.usage || args.server_name.empty() || args.port == 0) {
+    if (args.usage) {
         usage(argv[0]);
         return 0;
-    } */
+    }
 
     // 1. Create the node
     // Clients in P2P also need a port to listen on, even if they initiate connections.

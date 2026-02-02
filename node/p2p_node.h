@@ -25,17 +25,20 @@ private:
     std::atomic<bool> running;
     std::thread listener_thread;
 
+    std::vector<std::thread> client_threads;
+    std::mutex thread_mutex;
+
     void log_error(const char* prefix, int err) {
         char buf[BUFFER_SIZE];
         std::cerr << "[Error] " << prefix << " " << strerror_r(err, buf, sizeof(buf)) << std::endl;
     }
-
+    
     /**
      * Receive text over the provided socket file descriptor, and send it back to
      * the client.  When the client sends an EOF, return.
      *
-     * @param sd      The socket file descriptor to use for the echo operation
-     * @param verbose Should stats be printed upon completion?
+     * @param client_fd   The socket file descriptor to use for the echo operation
+     * @param verbose     Should stats be printed upon completion?
      */
     void echo_server(int client_fd, bool verbose) {
         // vars for tracking connection duration, bytes transmitted
@@ -121,7 +124,7 @@ private:
 
         // bind the socket to the server's address and the provided port, and then
         // start listening for connections
-        sockaddr_in server_addr{};
+        sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
         server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -139,7 +142,7 @@ private:
             return;
         }
 
-        std::cout << "[Server] Listening on port " << server_port << "..." << std::endl;
+        
         while (running) {
             std::cout << "Waiting for a client to connect...\n";
             sockaddr_in client_addr{};
@@ -153,8 +156,12 @@ private:
                 continue;
             }
 
-            std::thread(&P2PNode::handle_client, this, client_fd, client_addr).detach();
-            // handle_client(client_fd, client_addr);
+            {
+                std::lock_guard<std::mutex> lock(thread_mutex);
+                client_threads.emplace_back(&P2PNode::handle_client, this, client_fd, client_addr);
+            }
+
+            //std::thread(&P2PNode::handle_client, this, client_fd, client_addr).detach();
         }
 
         // Cleanup if loop exits naturally
@@ -176,6 +183,11 @@ public:
         if (listener_thread.joinable()) {
             listener_thread.join();
         }
+
+        std::lock_guard<std::mutex> lock(thread_mutex);
+        for (auto& t : client_threads) {
+            if (t.joinable()) t.join();
+        }
     }
 
     /**
@@ -192,8 +204,6 @@ public:
             log_error("DNS lookup failed", h_errno); // h_errno is specific to gethostbyname
             return -1;
         }
-
-        std::cout << "DNS lookup done\n";
 
         sockaddr_in peer_addr{};
         memset(&peer_addr, 0, sizeof(peer_addr));

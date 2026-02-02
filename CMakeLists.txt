@@ -26,12 +26,18 @@ add_executable(striped_lock_hash_table tests/test_striped_lock_concurrent_hash_t
 target_link_libraries(striped_lock_hash_table PRIVATE common_utils Threads::Threads)
 target_include_directories(striped_lock_hash_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_hash_table)
 
-add_library(p2p_lib INTERFACE node/p2p_node.h)
-target_include_directories(p2p_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(p2p_lib INTERFACE Threads::Threads)
+add_library(distributed_node_lib INTERFACE 
+    node/p2p_node.h
+    node/node.h
+)
+target_include_directories(distributed_node_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/node)
+target_link_libraries(distributed_node_lib INTERFACE Threads::Threads common_utils)
 
-add_executable(text_server node/text_server.cc)
-target_link_libraries(text_server p2p_lib)
+add_executable(text_server tests/text_server.cc)
+target_link_libraries(text_server distributed_node_lib)
 
-add_executable(text_client node/text_client.cc)
-target_link_libraries(text_client p2p_lib)
+add_executable(text_client tests/text_client.cc)
+target_link_libraries(text_client distributed_node_lib)
+
+add_executable(test_dht_node tests/test_dht_node.cpp)
+target_link_libraries(test_dht_node PRIVATE Threads::Threads distributed_node_lib)

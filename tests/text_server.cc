@@ -62,6 +62,10 @@ void parse_args(int argc, char **argv, arg_t &args) {
 int main(int argc, char** argv) {
     arg_t args;
     parse_args(argc, argv, args);
+    if (args.usage) {
+        usage(argv[0]);
+        return 0;
+    }
 
     std::cout << "Starting server on port " << args.port << "...\n";
     P2PNode node(args.port);
