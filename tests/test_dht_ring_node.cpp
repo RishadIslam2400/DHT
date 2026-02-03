@@ -1,7 +1,7 @@
 #include <iostream>
 #include <string>
 
-#include "ring_topology_node.h"
+#include "dht_ring_node.h"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {

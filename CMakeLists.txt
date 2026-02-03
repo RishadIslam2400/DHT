@@ -11,6 +11,8 @@ add_library(common_utils STATIC
     common/xxHash.h
     common/config_t.h
     common/config_t.cc
+    common/load_config.h
+    common/threadpool.h
 )
 target_include_directories(common_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
 
@@ -27,11 +29,14 @@ target_link_libraries(striped_lock_hash_table PRIVATE common_utils Threads::Thre
 target_include_directories(striped_lock_hash_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_hash_table)
 
 add_library(distributed_node_lib INTERFACE 
-    node/p2p_node.h
-    node/node.h
-    node/ring_topology_node.h
+    node/p2p_communication_node.h
+    node/dht_node.h
+    node/dht_consistent_hashing_node.h
+    node/dht_static_partitioning_node.h
 )
-target_include_directories(distributed_node_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/node)
+target_include_directories(distributed_node_lib INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/node
+)
 target_link_libraries(distributed_node_lib INTERFACE Threads::Threads common_utils)
 
 add_executable(text_server tests/text_server.cc)
