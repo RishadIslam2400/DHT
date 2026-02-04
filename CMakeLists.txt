@@ -74,7 +74,12 @@ add_executable(test_dht_node tests/test_dht_node.cpp)
 target_include_directories(test_dht_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
 target_link_libraries(test_dht_node PRIVATE distributed_node_lib)
 
-# DHT Node Test
-add_executable(test_dht_static_partitioning_node tests/test_dht_static_partitioning_node.cpp)
-target_include_directories(test_dht_static_partitioning_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(test_dht_static_partitioning_node PRIVATE distributed_node_lib)
+# DHT Static Partitioning Node Test
+add_executable(test_dht_static_partitioning tests/test_dht_static_partitioning.cpp)
+target_include_directories(test_dht_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
+target_link_libraries(test_dht_static_partitioning PRIVATE distributed_node_lib)
+
+# DHT Consistent Hashing Node Test
+add_executable(test_dht_consistent_hashing tests/test_dht_consistent_hashing.cpp)
+target_include_directories(test_dht_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
+target_link_libraries(test_dht_consistent_hashing PRIVATE distributed_node_lib)
