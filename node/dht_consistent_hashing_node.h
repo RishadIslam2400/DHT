@@ -16,10 +16,10 @@
 #include <shared_mutex>
 #include <memory>
 
-#include "../concurrent_hash_table/striped_lock_concurrent_hash_table.h"
-#include "../common/MurmurHash3.h"
-#include "../common/load_config.h"
-#include "../common/threadpool.h"
+#include "concurrent_hash_table/striped_lock_concurrent_hash_table.h"
+#include "common/MurmurHash3.h"
+#include "common/load_config.h"
+#include "common/threadpool.h"
 
 /**
  * This is a Static Consistent Hashing architecture.

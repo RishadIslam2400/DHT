@@ -6,6 +6,10 @@
 
 set -e # Halt the script on any error
 
+export SCREENDIR=$HOME/.screen
+mkdir -p $SCREENDIR
+chmod 700 $SCREENDIR
+
 # Print usage information
 usage() {
 	cat <<EOF
@@ -13,19 +17,45 @@ usage() {
 cl.sh — tool for building & running binary executables on the Sunlab
 Usage: ./cl.sh <command> [arguments]
 Commands:
-	install-deps            Setup SSH keys and verify remote hosts.
-	build-run <mode> <exe>  Compile and run a binary.
-							<mode>: debug | release
-	                        <exe> : Name of the target in build/
-	connect                 Open a screen session connected to all nodes.
-	reset					Kill a specific process name on all nodes.
-	reset-all               Kill all user processes on all nodes.
-	do-all <cmd>            Run a raw shell command on all nodes.
-Examples:
-	./cl.sh build-run debug my_app
-	./cl.sh do-all "uptime"
-...
+    install-deps            Setup SSH keys and verify remote hosts.
+    init-config             Generate the cluster configuration file (config.txt).
+    build-run <mode> <exe> <ops> <threads> <range>
+                            Compile and run a binary.
+                            <mode>: debug | release
+                            <exe> : Name of the target in build/
+                            <ops> : Number of operations
+                            <threads>: Number of threads
+                            <range> : Key range
+    connect                 Open a screen session connected to all nodes.
+    reset <proc_name>       Kill a specific process name on all nodes.
+    reset-all               Kill all user processes on all nodes.
+    do-all <cmd>            Run a raw shell command on all nodes.
 EOF
+}
+
+# Generate Property File
+function generate_cluster_config() {
+    OUTPUT_FILE="config.txt"
+    DEFAULT_PORT=1895
+    
+    echo "Generating cluster configuration: $OUTPUT_FILE"
+    
+    > "$OUTPUT_FILE"
+    
+    for i in "${!MACHINES[@]}"; do
+        host="${MACHINES[$i]}"
+        full_host="${host}.${DOMAIN}"
+        resolved_ip=$(getent hosts "$full_host" | awk '{ print $1 }' | head -n 1)
+        
+        if [ -z "$resolved_ip" ]; then
+            resolved_ip="$host"
+        fi
+        
+        # Write to file: ID IP PORT
+        echo "$i $resolved_ip $DEFAULT_PORT" >> "$OUTPUT_FILE"
+    done
+    
+    echo "Successfully created $OUTPUT_FILE with ${#MACHINES[@]} nodes."
 }
 
 # SSH into MACHINES once, to fix known_hosts
@@ -61,18 +91,35 @@ function cl_install_deps() {
 }
 
 # SEND and RUN a binary on the remote MACHINES
-# $1 : Relative path of exe
+# $1: Exe, $2: Ops, $3: Threads, $4: Key Range
 function cl_run() {
 	# check if file exists
 	EXE_NAME=$(basename "$1")
 	if [[ ! -f "build/$1" ]]; then
-		echo "Executable not found: $1"
+		echo "Error: Executable not found at build/$1"
 		exit 1
 	fi
-	for m in ${MACHINES[*]}; do
-		scp "build/$1" "${USER}@${m}.${DOMAIN}:${EXE_NAME}" &
-	done
-	wait
+	
+	if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
+        echo "Error: Missing arguments."
+        echo "Usage: ./cl.sh build-run <mode> <exe> <ops> <threads> <range>"
+        exit 1
+    fi
+	NUM_OPS=$2
+    NUM_THREADS=$3
+    KEY_RANGE=$4
+
+	if [[ ! -f "config.txt" ]]; then
+        echo "Error: config.txt not found!"
+        echo "Please run './cl.sh init-config' first."
+        exit 1
+    fi
+
+	echo "Uploading binary ($EXE_NAME) and config.txt..."
+    for m in ${MACHINES[*]}; do
+        scp "build/$1" "config.txt" "${USER}@${m}.${DOMAIN}:" &
+    done
+    wait
 	rm -rf logs
 	mkdir logs
 	# Set up a screen script for running the program on all MACHINES
@@ -82,9 +129,9 @@ function cl_run() {
 
 	for i in "${!MACHINES[@]}"; do
 		host="${MACHINES[$i]}"
-		ARGS="your args" # modify it
-		CMD="your binary" # modify it
-		echo "$CMD"
+		#ARGS="your args" # modify it
+		CMD="./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${NUM_THREADS} ${KEY_RANGE}"
+		echo "Node $i ($host): $CMD"
 		cat >>"$tmp_screen" <<EOF
 screen -t node${i} ssh ${USER}@${host}.${DOMAIN} ${CMD}; bash
 logfile logs/log_${i}.txt
@@ -94,49 +141,6 @@ EOF
 
 	screen -c "$tmp_screen"
 	rm "$tmp_screen"
-}
-
-# $1 : Relative path of exe
-function cl_debug() {
-	EXE_NAME=$(basename "$1")
-	if [[ ! -f "build/$1" ]]; then
-		echo "Executable not found: $1"
-		exit 1
-	fi
-	# Send the executable to all MACHINES
-	for m in ${MACHINES[*]}; do
-		scp "build/$1" "${USER}@${m}.${DOMAIN}:${EXE_NAME}" &
-	done
-	wait
-	rm -rf gdb-logs
-	mkdir gdb-logs
-
-	# Set up a screen script for running the program on all MACHINES
-	tmp_screen="$(mktemp)" || exit 1
-	make_screen $tmp_screen
-
-	gdb_cmd="$2"
-	echo "Running gdb with command: $gdb_cmd"
-
-	for i in "${!MACHINES[@]}"; do
-		host="${MACHINES[$i]}"
-		CMD="--hostname ${host} --node-id ${i} --leader-fixed ${ARGS}"
-		if [[ $i -eq 0 && -n "$gdb_cmd" ]]; then
-			cat >>"$tmp_screen" <<EOF
-screen -t node${i} ssh ${USER}@${host}.${DOMAIN} gdb -ex \"${gdb_cmd}\" -ex \"r\" --args ./${EXE_NAME} ${CMD}; bash
-logfile gdb-logs/gdb_${i}.log
-log on
-EOF
-		else
-			cat >>"$tmp_screen" <<EOF
-screen -t node${i} ssh ${USER}@${host}.${DOMAIN} gdb -ex \"r\" --args ./${EXE_NAME} ${CMD}; bash
-logfile gdb-logs/gdb_${i}.log
-log on
-EOF
-		fi
-	done
-	screen -c $tmp_screen
-	rm $tmp_screen
 }
 
 # Connect to remote nodes (e.g., for debugging)
@@ -163,7 +167,7 @@ function do_all {
 function reset-all() {
 	last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
 	for i in $(seq 0 ${last_valid_index}); do
-		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "sudo killall -9 -u $USER" &
+		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "killall -9 -u $USER" &
 	done
 	wait
 	echo "Nodes have been reset."
@@ -172,7 +176,7 @@ function reset-all() {
 function reset() {
 	last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
 	for i in $(seq 0 ${last_valid_index}); do
-		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "sudo pkill $1" &
+		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "pkill $1 || true" &
 	done
 	wait
 	echo "Nodes have been reset."
@@ -193,17 +197,28 @@ done
 
 if [[ "$cmd" == "install-deps" && "$count" -eq 1 ]]; then
 	cl_install_deps
-elif [[ "$cmd" == "build-run" && "$count" -eq 3 ]]; then
+elif [[ "$cmd" == "init-config" ]]; then
+    generate_cluster_config
+elif [[ "$cmd" == "build-run" && "$count" -eq 6 ]]; then
 	if [[ "$2" != "debug" && "$2" != "release" ]]; then
 		usage
 		exit 1
 	fi
+
+	rm -rf build
+	mkdir build
+	cd build
+
 	if [[ "$2" == "debug" ]]; then
-		make DEBUG=1
+		cmake -DCMAKE_BUILD_TYPE=Debug ..
 	else 
-		make
+		cmake -DCMAKE_BUILD_TYPE=Release ..
 	fi
-	cl_run "$3"
+
+	make -j$(nproc)
+	cd .. # return to root file
+
+	cl_run "$3" "$4" "$5" "$6"
 elif [[ "$cmd" == "connect" && "$count" -eq 1 ]]; then
 	cl_connect
 elif [[ "$cmd" == "reset" && "$count" -eq 2 ]]; then

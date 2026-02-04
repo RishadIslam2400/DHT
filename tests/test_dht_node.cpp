@@ -2,7 +2,8 @@
 #include <string>
 #include <thread>
 #include <chrono>
-#include "node.h"
+
+#include "dht_node.h"
 
 int main(int argc, char** argv) {
     std::string target_ip;

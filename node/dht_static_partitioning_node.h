@@ -17,10 +17,10 @@
 #include <arpa/inet.h>
 #include <memory>
 
-#include "../concurrent_hash_table/striped_lock_concurrent_hash_table.h"
-#include "../common/MurmurHash3.h"
-#include "../common/load_config.h"
-#include "../common/threadpool.h"
+#include "concurrent_hash_table/striped_lock_concurrent_hash_table.h"
+#include "common/MurmurHash3.h"
+#include "common/load_config.h"
+#include "common/threadpool.h"
 
 class StaticClusterDHTNode {
 private:
@@ -212,7 +212,7 @@ private:
     }
 
 public:
-    StaticClusterDHTNode(std::string config_file, int my_id) : running(false), benchmark_ready(false), server_fd(-1) {
+    StaticClusterDHTNode(std::string config_file, int my_id) : server_fd(-1), running(false), benchmark_ready(false) {
         cluster_map = load_config(config_file);
         
         bool found = false;
@@ -297,7 +297,7 @@ public:
                     if (res == "READY")
                         ready_count++;
                 }
-                if (ready_count == cluster_map.size() - 1) {
+                if (ready_count == static_cast<int>(cluster_map.size()) - 1) {
                     std::cout << "[Coordinator] All peers online. Sending GO signal!\n";
                     break;
                 }

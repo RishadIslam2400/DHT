@@ -10,7 +10,7 @@
 #include <libgen.h>
 
 
-#include "p2p_node.h"
+#include "p2p_communication_node.h"
 
 /**
  * Display a help message to explain how the command-line parameters for this

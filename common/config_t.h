@@ -17,11 +17,11 @@ struct config_t {
     // The number of iterations for which a test should run
     int iters;
 
-    // The number of threads to use
-    int threads;
-
     // The numbers of swaps allowed
     int limit;
+
+    // The number of threads to use
+    int threads;
 
     // simple constructor
     config_t() : key_max(10000), iters(1000000), limit(5), threads(4) { }

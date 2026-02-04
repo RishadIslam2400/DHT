@@ -13,7 +13,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
-#include "../concurrent_hash_table/striped_lock_concurrent_hash_table.h"
+#include "concurrent_hash_table/striped_lock_concurrent_hash_table.h"
 
 /**
  * In a peer-to-peer (P2P) Distributed Hash Table, every node must act as both a Server and a Client simultaneously.

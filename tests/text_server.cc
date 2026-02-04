@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <libgen.h>
 
-#include "p2p_node.h"
+#include "p2p_communication_node.h"
 
 /** Print a message to inform the user of how to use this program */
 void usage(char *progname) {
