@@ -233,15 +233,12 @@ private:
 
 public:
     ConsistentHashingDHTNode(std::string& filename, int my_id, int virtual_nodes = 100)
-        : running(false), benchmark_ready(false), server_fd(-1), num_virtual_nodes(virtual_nodes)
+        : num_virtual_nodes(virtual_nodes), server_fd(-1), running(false), benchmark_ready(false)
     {
         physical_nodes = load_config(filename);
 
         bool found = false;
         for (const NodeConfig& node : physical_nodes) {
-            uint64_t h = hash_key(node.ip);
-            ring[h] = node;
-
             if (node.id == my_id) {
                 self_config = node;
                 found = true;
@@ -313,7 +310,7 @@ public:
                     break;
                 }
 
-                std::cout << "[Coordinator] Waiting... (" << ready_count << "/" << ring.size()-1 << ")\n";
+                std::cout << "[Coordinator] Waiting... (" << ready_count << "/" << physical_nodes.size()-1 << ")\n";
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
