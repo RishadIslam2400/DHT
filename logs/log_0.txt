@@ -1,3 +1,0 @@
-./test_dht_static_partitioning_node: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by ./test_dht_static_partitioning_node)
-./test_dht_static_partitioning_node: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by ./test_dht_static_partitioning_node)
-./test_dht_static_partitioning_node: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.29' not found (required by ./test_dht_static_partitioning_node)
