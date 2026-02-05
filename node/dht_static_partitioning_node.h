@@ -45,12 +45,12 @@ struct RequestMsg {
     CommandType cmd;
     int32_t key;
     int32_t value;
-} __attribute__((packed));
+};
 
 struct ResponseMsg {
     uint8_t status;
     int32_t value;
-} __attribute__((packed));
+};
 
 class StaticClusterDHTNode
 {
