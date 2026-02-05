@@ -9,6 +9,7 @@
 #include <map>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <cstring>
 #include <arpa/inet.h>
@@ -218,10 +219,10 @@ private:
             log_error("setsockopt(SO_REUSEADDR) failed: ", errno);
             return;
         }
-        /* if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+        if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
             log_error("Disabling Nagle's Algorithm failed: ", errno);
             return;
-        } */
+        }
 
         // bind socket
         if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -248,10 +249,10 @@ private:
                 continue;
             }
 
-            /* if (setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+            if (setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
                 log_error("Disabling Nagle's Algorithm failed: ", errno);
                 return;
-            } */
+            }
 
             std::thread([this, new_socket]() {
                 this->handle_client(new_socket);
@@ -435,11 +436,11 @@ public:
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-        /* int opt = 1;
+        int opt = 1;
         if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
             close(sock);
             ResponseMsg{0, 0};
-        } */
+        }
 
         // connect socket
         if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) < 0) {
