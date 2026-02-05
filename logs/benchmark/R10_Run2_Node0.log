@@ -1,0 +1,57 @@
+Booted Consistent Node 0 (128.180.120.67)
+Ring Topology: 3 Physical Nodes, 300 Virtual Nodes.
+[Coordiator] Checking if ring peers are ready...
+Node listening on port 1895...
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] Waiting... (0/2)
+[Coordinator] All peers online. Sending GO signal!
+[TestApp] Barrier passed. Starting workload with Key Range: 10
+Benchmark RESULTS (Node 0)
+
+Node 0 Statistics
+LOCAL STORAGE METRICS
+Local PUTs (Success/Insert): 3
+Local PUTs (Fail/Update):    17422
+Total Local PUTs:            17425
+
+Local GETs (Success/Found):  68661
+Local GETs (Fail/NotFound):  14
+Total Local GETs:            68675
+REMOTE TRAFFIC METRICS
+Remote PUTs Sent:            13917
+Remote GETs Sent:            56007
+
+Performance Metrics
+Key Range:       10
+Total Ops:       99999
+Time Elapsed:    29.405 s
+Throughput:      3400.75 ops/sec
+Average Latency: 877.89 us

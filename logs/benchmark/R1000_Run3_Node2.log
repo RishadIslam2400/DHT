@@ -1,0 +1,26 @@
+Booted Consistent Node 2 (128.180.120.70)
+Ring Topology: 3 Physical Nodes, 300 Virtual Nodes.
+[Worker] Waiting for Coordinator...
+Node listening on port 1895...
+[Worker] GO received!
+Benchmark RESULTS (Node 2)
+
+Node 2 Statistics
+LOCAL STORAGE METRICS
+Local PUTs (Success/Insert): 294
+Local PUTs (Fail/Update):    14473
+Total Local PUTs:            14767
+
+Local GETs (Success/Found):  57906
+Local GETs (Fail/NotFound):  1185
+Total Local GETs:            59091
+REMOTE TRAFFIC METRICS
+Remote PUTs Sent:            14112
+Remote GETs Sent:            56225
+
+Performance Metrics
+Key Range:       1000
+Total Ops:       99999
+Time Elapsed:    37.7086 s
+Throughput:      2651.89 ops/sec
+Average Latency: 1129.55 us

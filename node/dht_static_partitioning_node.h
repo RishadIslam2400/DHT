@@ -12,6 +12,7 @@
 #include <functional>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <cstring>
 #include <arpa/inet.h>
@@ -33,7 +34,26 @@ struct NodeStats {
     std::atomic<uint32_t> remote_gets{0};
 };
 
-class StaticClusterDHTNode {
+enum CommandType : uint8_t {
+    CMD_PING = 0,
+    CMD_GO = 1,
+    CMD_PUT = 2,
+    CMD_GET = 3
+};
+
+struct RequestMsg {
+    CommandType cmd;
+    int32_t key;
+    int32_t value;
+} __attribute__((packed));
+
+struct ResponseMsg {
+    uint8_t status;
+    int32_t value;
+} __attribute__((packed));
+
+class StaticClusterDHTNode
+{
 private:
     StripedLockConcurrentHashTable<int, int> storage;    
     std::vector<NodeConfig> cluster_map;
@@ -68,6 +88,60 @@ private:
         return cluster_map[target_index];
     }
 
+    bool put_local(int key, int value) {
+        bool success = storage.put(key, value);
+        if (success) {
+            stats.local_puts_success++; // new key inserted into storage
+        } else {
+            stats.local_puts_failed++; // key updated in storage
+        }
+
+        return success;
+    }
+
+    std::optional<int> get_local(int key) {
+        auto res = storage.get(key);
+        if (res.has_value()) {
+            stats.local_gets_success++; // Key found
+        } else {
+            stats.local_gets_failed++; // Null
+        }
+
+        return res;
+    }
+
+    ResponseMsg handle_request(RequestMsg& request) {
+        request.key = ntohl(request.key);
+        request.value = ntohl(request.value);
+
+        switch (request.cmd) {
+            case CMD_PUT: {
+                bool success = put_local(request.key, request.value);
+                
+                // status = 1 (RPC Success)
+                // value  = 1 (Insert) or 0 (Update)
+                return ResponseMsg{1, static_cast<int32_t>(htonl(success))};
+            }
+            case CMD_GET: {
+                std::optional<int> res = get_local(request.key);
+                if (res.has_value()) {
+                    // status = 1 (Found), value = data
+                    return ResponseMsg{1, static_cast<int32_t>(htonl(res.value()))};
+                } else {
+                    // status = 0 (Not Found / Error)
+                    return ResponseMsg{0, 0};
+                }
+            }
+            case CMD_PING:
+            case CMD_GO:
+                if (request.cmd == CMD_GO)
+                    benchmark_ready = true;
+                return ResponseMsg{1, 0};
+        }
+
+        return ResponseMsg{0, 0};
+    }
+
     static bool recv_n_bytes(int sock, void* buffer, size_t n) {
         size_t total_read = 0;
         char *buf_ptr = static_cast<char *>(buffer);
@@ -85,70 +159,27 @@ private:
         return true;
     }
 
-    // Protocol: [4 bytes length (Network Order)][Data...]
-    static bool recv_framed(int sock, std::string& out_msg) {
-        uint32_t len_net;
-        if (!recv_n_bytes(sock, &len_net, sizeof(len_net))) return false;
-        
-        uint32_t len_host = ntohl(len_net);
-        if (len_host > 10 * 1024 * 1024) return false;
-
-        std::vector<char> buf(len_host);
-        if (!recv_n_bytes(sock, buf.data(), len_host)) return false;
-
-        out_msg.assign(buf.data(), len_host);
-        return true;
-    }
-
-    static bool send_framed(int sock, const std::string& msg) {
-        uint32_t len_host = static_cast<uint32_t>(msg.length());
-        uint32_t len_net = htonl(len_host);
-
-        // Send Header
-        if (send(sock, &len_net, sizeof(len_net), MSG_NOSIGNAL) != sizeof(len_net)) 
-            return false;
-    
-        // Send Body
-        size_t total_sent = 0;
-        while (total_sent < len_host) {
-            ssize_t sent = send(sock, msg.data() + total_sent, len_host - total_sent, MSG_NOSIGNAL);
-            if (sent < 0) {
-                if (errno == EINTR)
-                    continue;
-                return false;
-            }
-            total_sent += sent;
-        }
-        return true;
-    }
-
-    std::string handle_request(const std::string& request) {
-        std::stringstream ss(request);
-        std::string command;
-        int key, value;
-        ss >> command;
-
-        if (command == "PUT") {
-            if (ss >> key >> value)
-                return put(key, value);
-        } else if (command == "GET") {
-            if (ss >> key)
-                return get(key);
-        } else if (command == "PING") {
-            return "READY";
-        } else if (command == "GO") {
-            benchmark_ready = true;
-            return "OK";
-        }
-        return "ERROR";
-    }
-
     void handle_client(int client_socket) {
-        std::string request;
-        while (recv_framed(client_socket, request)) {
-            std::string response = handle_request(request);
-            if (!send_framed(client_socket, response))
+        uint8_t buffer[9];
+
+        while (recv_n_bytes(client_socket, buffer, 9)) {
+            RequestMsg request;
+
+            // Deserialize
+            request.cmd = static_cast<CommandType>(buffer[0]);
+            std::memcpy(&request.key, &buffer[1], 4);
+            std::memcpy(&request.value, &buffer[5], 4);
+
+            ResponseMsg response = handle_request(request);
+
+            // Serialize response
+            uint8_t response_buffer[5];
+            response_buffer[0] = response.status;
+            std::memcpy(&response_buffer[1], &response.value, 4);
+
+            if (send(client_socket, response_buffer, 5, MSG_NOSIGNAL) != 5) {
                 break;
+            }
         }
 
         close(client_socket);
@@ -174,6 +205,10 @@ private:
             log_error("setsockopt(SO_REUSEADDR) failed: ", errno);
             return;
         }
+        /* if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+            log_error("Disabling Nagle's Algorithm failed: ", errno);
+            return;
+        } */
 
         // bind socket
         if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -200,6 +235,11 @@ private:
                 continue;
             }
 
+            /* if (setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+                log_error("Disabling Nagle's Algorithm failed: ", errno);
+                return;
+            } */
+
             std::thread([this, new_socket]() {
                 this->handle_client(new_socket);
             }).detach();
@@ -218,27 +258,20 @@ private:
 public:
     StaticClusterDHTNode(std::string config_file, int my_id) : server_fd(-1), running(false), benchmark_ready(false) {
         cluster_map = load_config(config_file);
-        
-        bool found = false;
         for (const NodeConfig& node : cluster_map) {
-            if (node.id == my_id) {
-                self_config = node;
-                found = true;
+            if (node.id == my_id) { 
+                self_config = node; 
                 break;
             }
-        }
-
-        if (!found) {
-            throw std::runtime_error("Node ID not found in configuration.");
         }
         
         // Initialize ThreadPool with hardware concurrency (or default to 4)
         /* unsigned int threads = std::thread::hardware_concurrency();
         if (threads == 0)
             threads = 4;
-        thread_pool = std::make_unique<ThreadPool>(threads);
+        thread_pool = std::make_unique<ThreadPool>(threads); */
         
-        std::cout << "Booted Node " << my_id << " (" << self_config.ip << ") with " << threads << " worker threads.\n"; */
+        std::cout << "Booted Node " << my_id << " (" << self_config.ip << ")\n";
     }
 
     ~StaticClusterDHTNode() {
@@ -264,41 +297,48 @@ public:
         // thread_pool.reset();
     }
 
-    std::string put(int key, int value) {
+    bool put(int key, int value) {
         NodeConfig target = get_target_node(key);
 
         if (target.id == self_config.id) {
-            bool success_op = storage.put(key, value);
-            if (success_op) {
-                stats.local_puts_success++;
-            } else {
-                stats.local_puts_failed++;
+            return put_local(key, value);
+        } else {
+            stats.remote_puts++;
+
+            RequestMsg request;
+            request.cmd = CMD_PUT;
+            request.key = htonl(key);
+            request.value = htonl(value);
+            ResponseMsg response = send_request(target.ip, request, target.port);
+            
+            if (response.status == 0) {
+                // Network error
+                return false;
             }
 
-            return "OK";
-        } else {
-            // std::cout << "Routing " << key << " to Node " << target.id << "\n";
-            stats.remote_puts++;
-            std::string msg = "PUT " + std::to_string(key) + " " + std::to_string(value);
-            return send_request(target.ip, msg, target.port);
-        } 
+            return ntohl(response.value) != 0;
+        }
     }
 
-    std::string get(int key) {
+    std::optional<int> get(int key) {
         NodeConfig target = get_target_node(key);
 
         if (target.id == self_config.id) {
-            auto res = storage.get(key);
-            if (res.has_value()) {
-                stats.local_gets_success++;
-                return std::to_string(res.value());
-            } else {
-                stats.local_gets_failed++;
-                return "NOT FOUND";
-            }
+            return get_local(key);
         } else {
             stats.remote_gets++;
-            return send_request(target.ip, "GET " + std::to_string(key), target.port);
+            RequestMsg request;
+            request.cmd = CMD_GET;
+            request.key = htonl(key);
+            request.value = 0; // padding
+            
+            ResponseMsg response = send_request(target.ip, request, target.port);
+
+            if (response.status == 1) {
+                return ntohl(response.value);
+            }
+
+            return std::nullopt;
         }
     }
 
@@ -311,21 +351,29 @@ public:
                 for (const NodeConfig& node : cluster_map) {
                     if (node.id == 0)
                         continue;
-                    std::string res = send_request(node.ip, "PING", node.port);
-                    if (res == "READY")
+
+                    RequestMsg ping_msg{CMD_PING, 0, 0};
+                    ResponseMsg res = send_request(node.ip, ping_msg, node.port);
+                    
+                    if (res.status == 1)
                         ready_count++;
                 }
+
                 if (ready_count == static_cast<int>(cluster_map.size()) - 1) {
                     std::cout << "[Coordinator] All peers online. Sending GO signal!\n";
                     break;
                 }
+                
                 std::cout << "[Coordinator] Waiting for peers (" << ready_count << "/" << cluster_map.size()-1 << ")...\n";
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
             for (const auto& node : cluster_map) {
-                if (node.id == 0) continue;
-                send_request(node.ip, "GO", node.port);
+                if (node.id == 0)
+                    continue;
+
+                RequestMsg go_msg{CMD_GO, 0, 0};
+                send_request(node.ip, go_msg, node.port);
             }
             
             benchmark_ready = true;
@@ -335,23 +383,24 @@ public:
             while (running && !benchmark_ready) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
+
             std::cout << "[Worker] GO signal received! Starting...\n";
         }
     }
 
-    static std::string send_request(const std::string& ip, const std::string& message, int target_port = 1895) {
+    static ResponseMsg send_request(const std::string& ip, const RequestMsg& request, int target_port = 1895) {
         sockaddr_in node_addr;
         memset(&node_addr, 0, sizeof(node_addr));
         node_addr.sin_family = AF_INET;
         node_addr.sin_port = htons(target_port);
         if (inet_pton(AF_INET, ip.c_str(), &node_addr.sin_addr) <= 0) {
-            return "ERROR: Invalid address";
+            return ResponseMsg{0, 0};
         }
 
         // create socket
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
-            return "ERROR: Error creating socket to send";
+            return ResponseMsg{0, 0};
         }
 
         struct timeval timeout;
@@ -360,22 +409,37 @@ public:
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
+        /* int opt = 1;
+        if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+            close(sock);
+            ResponseMsg{0, 0};
+        } */
+
         // connect socket
         if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) < 0) {
             close(sock);
-            return "ERROR: Connection failed";
+            return ResponseMsg{0, 0};
         }
 
-        if (!send_framed(sock, message)) {
+        uint8_t buffer[9];
+        buffer[0] = request.cmd;
+        std::memcpy(&buffer[1], &request.key, 4);
+        std::memcpy(&buffer[5], &request.value, 4);
+
+        if (send(sock, buffer, 9, MSG_NOSIGNAL) != 9) {
             close(sock);
-            return "ERROR: Send failed";
+            return ResponseMsg{0, 0};
         }
 
-        std::string response;
-        if (!recv_framed(sock, response)) {
+        uint8_t response_buffer[5];
+        if (!recv_n_bytes(sock, response_buffer, 5)) {
             close(sock);
-            return "ERROR: Receive failed";
+            return ResponseMsg{0, 0};
         }
+
+        ResponseMsg response;
+        response.status = response_buffer[0];
+        std::memcpy(&response.value, &response_buffer[1], 4);
 
         close(sock);
         return response;

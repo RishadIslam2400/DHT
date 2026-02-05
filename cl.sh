@@ -177,6 +177,60 @@ function reset() {
 	echo "Nodes have been reset."
 }
 
+function cl_benchmark() {
+    EXE_NAME=$(basename "$1")
+    NUM_OPS=$2
+    NUM_THREADS=$3
+    
+    if [[ -z "$1" || -z "$2" || -z "$3" ]]; then
+        echo "Usage: ./cl.sh benchmark <exe> <ops> <threads>"
+        exit 1
+    fi
+
+    generate_cluster_config
+
+    echo "Uploading config.txt to all nodes..."
+    for m in ${MACHINES[*]}; do
+        scp "config.txt" "${USER}@${m}.${DOMAIN}:${REMOTE_BUILD_DIR}/" &
+    done
+    wait
+
+    LOG_DIR="logs/benchmark"
+    rm -rf "$LOG_DIR"
+    mkdir -p "$LOG_DIR"
+
+    KEY_RANGES=(10 100 1000 10000)
+    RUNS=3
+
+    echo "Starting Benchmark Suite: ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
+
+    # 3. The Loop
+    for range in "${KEY_RANGES[@]}"; do
+        for run in $(seq 1 $RUNS); do
+            echo "BENCHMARK: Range=$range, Run=$run/$RUNS"
+            
+            pids=""
+            for i in "${!MACHINES[@]}"; do
+                host="${MACHINES[$i]}"
+                
+                CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${NUM_THREADS} ${range}"
+                
+                LOG_FILE="${LOG_DIR}/R${range}_Run${run}_Node${i}.log"
+                
+                ssh "${USER}@${host}.${DOMAIN}" "$CMD" > "$LOG_FILE" 2>&1 &
+                
+                pids="$pids $!"
+            done
+            
+            # Wait for all nodes to finish this specific run before continuing
+            wait $pids || true
+            echo "Run $run completed. Logs saved to $LOG_DIR"
+        done
+    done
+    echo "Benchmark Suite Completed."
+    echo "Results available in: $LOG_DIR"
+}
+
 
 # Get the important stuff out of the command-line args
 cmd=$1   # The requested command
@@ -196,6 +250,8 @@ elif [[ "$cmd" == "init-config" ]]; then
     generate_cluster_config
 elif [[ "$cmd" == "run" && "$count" -eq 5 ]]; then
 	cl_run "$2" "$3" "$4" "$5"
+elif [[ "$cmd" == "benchmark" && "$count" -eq 4 ]]; then
+    cl_benchmark "$2" "$3" "$4"
 elif [[ "$cmd" == "connect" && "$count" -eq 1 ]]; then
 	cl_connect
 elif [[ "$cmd" == "reset" && "$count" -eq 2 ]]; then

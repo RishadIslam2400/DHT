@@ -13,52 +13,64 @@ void run_correctness_test(ConsistentHashingDHTNode& node, int my_id) {
     // Test 1: Node 0 writes (1, 100)
     if (my_id == 0) {
         std::cout << "[Test] Node 0 performing PUT(1, 100)...\n";
-        std::string res = node.put(1, 100);
-        std::cout << "[Test] Node 0 PUT result: " << res << "\n";
+        bool res = node.put(1, 100);
+        std::cout << "[Test] Node 0 PUT result: " << std::boolalpha << res << "\n";
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     // Everyone verifies Key 1
-    std::string val1 = node.get(1);
-    if (val1 == "100") {
+    std::optional<int> val1 = node.get(1);
+    if (val1.has_value() && val1.value() == 100) {
         std::cout << "[PASS] Node " << my_id << " read Key 1 correctly (Got: 100)\n";
     } else {
-        std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 100, Got: " << val1 << "\n";
+        if (!val1.has_value()) {
+            std::cout << "[FAIL] Node " << my_id << " failed Key 1 not found.\n";
+        } else {
+            std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 100, Got: " << val1.value() << "\n";
+        }
     }
 
     // Test 2: Node 1 writes (2, 200)
     if (my_id == 1) {
         std::cout << "[Test] Node 1 performing PUT(2, 200)...\n";
-        std::string res = node.put(2, 200);
-        std::cout << "[Test] Node 1 PUT result: " << res << "\n";
+        bool res = node.put(2, 200);
+        std::cout << "[Test] Node 1 PUT result: " << std::boolalpha << res << "\n";
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     // Everyone verifies Key 2
-    std::string val2 = node.get(2);
-    if (val2 == "200") {
+    std::optional<int> val2 = node.get(2);
+    if (val2.has_value() && val2.value() == 200) {
         std::cout << "[PASS] Node " << my_id << " read Key 2 correctly (Got: 200)\n";
     } else {
-        std::cout << "[FAIL] Node " << my_id << " failed Key 2. Expected: 200, Got: " << val2 << "\n";
+        if (!val2.has_value()) {
+            std::cout << "[FAIL] Node " << my_id << " failed Key 1 not found.\n";
+        } else {
+            std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 200, Got: " << val2.value() << "\n";
+        }
     }
 
     // Test 3: Node 2 writes (3, 300)
     if (my_id == 2) {
         std::cout << "[Test] Node 2 performing PUT(3, 300)...\n";
-        std::string res = node.put(3, 300);
-        std::cout << "[Test] Node 2 PUT result: " << res << "\n";
+        bool res = node.put(3, 300);
+        std::cout << "[Test] Node 2 PUT result: " << std::boolalpha << res << "\n";
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     // Everyone verifies Key 3
-    std::string val3 = node.get(3);
-    if (val3 == "300") {
+    std::optional<int> val3 = node.get(3);
+    if (val3.has_value() && val3.value() == 300) {
         std::cout << "[PASS] Node " << my_id << " read Key 3 correctly (Got: 300)\n";
     } else {
-        std::cout << "[FAIL] Node " << my_id << " failed Key 3. Expected: 300, Got: " << val3 << "\n";
+        if (!val3.has_value()) {
+            std::cout << "[FAIL] Node " << my_id << " failed Key 1 not found.\n";
+        } else {
+            std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 300, Got: " << val3.value() << "\n";
+        }
     }
 
     std::cout << ">>> [Test] Verification Complete for Node " << my_id << ".\n\n";

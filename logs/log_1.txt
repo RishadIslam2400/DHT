@@ -1,15 +1,24 @@
-Booted Consistent Node 1 (128.180.120.66)
-Ring Topology: 3 Physical Nodes, 300 Virtual Nodes.
-[Worker] Waiting for Coordinator...
+[Worker] Waiting for Coordinator (Node 0)...
 Node listening on port 1895...
-[Worker] GO received!
+[Worker] GO signal received! Starting...
+Benchmark RESULTS (Node 1)
 
->>> [Test] Starting 3-Node Verification on Node 1...
-[PASS] Node 1 read Key 1 correctly (Got: 100)
-[Test] Node 1 performing PUT(2, 200)...
-[Test] Node 1 PUT result: OK
-[PASS] Node 1 read Key 2 correctly (Got: 200)
-[PASS] Node 1 read Key 3 correctly (Got: 300)
->>> [Test] Verification Complete for Node 1.
+Node 1 Statistics
+LOCAL STORAGE METRICS
+Local PUTs (Success/Insert): 336
+Local PUTs (Fail/Update):    17792
+Total Local PUTs:            18128
 
-n 
+Local GETs (Success/Found):  70601
+Local GETs (Fail/NotFound):  1359
+Total Local GETs:            71960
+REMOTE TRAFFIC METRICS
+Remote PUTs Sent:            13281
+Remote GETs Sent:            53085
+
+Performance Metrics
+Key Range:       1000
+Total Ops:       99999
+Time Elapsed:    25.7199 s
+Throughput:      3888.01 ops/sec
+Average Latency: 766.80 us
