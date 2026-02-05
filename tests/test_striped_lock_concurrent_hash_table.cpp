@@ -17,26 +17,26 @@ void test_basic_operations() {
     StripedLockConcurrentHashTable<std::string, int> ht(10);
 
     // insert
-    ht.insert("key1", 100);
-    ht.insert("key2", 200);
+    ht.put("key1", 100);
+    ht.put("key2", 200);
 
     // search
-    auto val1 = ht.search("key1");
-    auto val2 = ht.search("key2");
-    auto val3 = ht.search("key_missing");
+    auto val1 = ht.get("key1");
+    auto val2 = ht.get("key2");
+    auto val3 = ht.get("key_missing");
 
     assert(val1.has_value() && val1.value() == 100);
     assert(val2.has_value() && val2.value() == 200);
     assert(!val3.has_value());
 
     // update
-    ht.insert("key1", 101);
-    val1 = ht.search("key1");
+    ht.put("key1", 101);
+    val1 = ht.get("key1");
     assert(val1.value() == 101);
 
     // remove
     ht.remove("key1");
-    val1 = ht.search("key1");
+    val1 = ht.get("key1");
     assert(!val1.has_value());
     assert(ht.get_count() == 1);
 
@@ -45,7 +45,7 @@ void test_basic_operations() {
 
 void insert_range(StripedLockConcurrentHashTable<int, int>& ht, int start, int end) {
     for (int i = start; i < end; ++i) {
-        ht.insert(i, i * 10);
+        ht.put(i, i * 10);
     }
 }
 
@@ -67,10 +67,10 @@ void test_concurrent_inserts() {
     int expected = num_threads * items_per_thread;
     assert(ht.get_count() == expected);
 
-    auto res = ht.search(500);
+    auto res = ht.get(500);
     assert(res.has_value() && res.value() == 5000);
 
-    res = ht.search(15000);
+    res = ht.get(15000);
     assert(res.has_value() && res.value() == 150000);
 
     log("Concurrent Inserts Test Passed");
@@ -83,7 +83,7 @@ void test_concurrent_read_writes() {
 
     std::thread writer([&]() {
         for (int i = 0; i < 1000; ++i) {
-            ht.insert("Key" + std::to_string(i), i);
+            ht.put("Key" + std::to_string(i), i);
             std::this_thread::sleep_for(std::chrono::microseconds(1));
         }
         done = true;
@@ -91,13 +91,13 @@ void test_concurrent_read_writes() {
 
     std::thread reader([&]() {
         while (!done) {
-            auto res = ht.search("Key50");
+            auto res = ht.get("Key50");
             if (res.has_value()) {
                 assert(res.value() == 50);
             }
         }
 
-        auto res = ht.search("Key999");
+        auto res = ht.get("Key999");
         if (res.has_value()) {
             assert(res.value() == 999);
         }

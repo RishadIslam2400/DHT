@@ -75,7 +75,7 @@ public:
     }
 
     // insert requires exclusive access
-    void insert(const K& key, const V& value) {
+    bool put(const K& key, const V& value) {
         std::unique_lock<std::shared_mutex> lock(table_mutex);
 
         if ((float)(count + 1) / capacity > load_factor) {
@@ -89,17 +89,18 @@ public:
         for (Ht_item<K, V>& item : bucket) {
             if (item.key == key) {
                 item.value = value;
-                return;
+                return false;
             }
         }
 
         // If not found, insert at the end of the bucket (handle collision)
         bucket.push_back({key, value});
         count++;
+        return true;
     }
 
     // Reader lock here, allows concurrent reading by multiple threads
-    std::optional<V> search(const K& key) {
+    std::optional<V> get(const K& key) {
         std::shared_lock<std::shared_mutex> lock(table_mutex);
 
         unsigned long index = hash_function(key, capacity);

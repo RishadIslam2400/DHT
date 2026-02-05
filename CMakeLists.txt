@@ -36,8 +36,6 @@ target_link_libraries(common_utils PUBLIC Threads::Threads)
 
 add_library(distributed_node_lib INTERFACE)
 target_sources(distributed_node_lib INTERFACE
-    node/p2p_communication_node.h
-    node/dht_node.h
     node/dht_consistent_hashing_node.h
     node/dht_static_partitioning_node.h
 )
@@ -59,21 +57,6 @@ add_executable(striped_lock_hash_table tests/test_striped_lock_concurrent_hash_t
 target_link_libraries(striped_lock_hash_table PRIVATE common_utils)
 target_include_directories(striped_lock_hash_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_hash_table)
 
-# Text Server (Simple TCP Test)
-add_executable(text_server tests/text_server.cc)
-target_include_directories(text_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(text_server PRIVATE distributed_node_lib)
-
-# Text Client (Simple TCP Test)
-add_executable(text_client tests/text_client.cc)
-target_include_directories(text_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(text_client PRIVATE distributed_node_lib)
-
-# DHT Node Test
-add_executable(test_dht_node tests/test_dht_node.cpp)
-target_include_directories(test_dht_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(test_dht_node PRIVATE distributed_node_lib)
-
 # DHT Static Partitioning Node Test
 add_executable(test_dht_static_partitioning tests/test_dht_static_partitioning.cpp)
 target_include_directories(test_dht_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
@@ -83,3 +66,13 @@ target_link_libraries(test_dht_static_partitioning PRIVATE distributed_node_lib)
 add_executable(test_dht_consistent_hashing tests/test_dht_consistent_hashing.cpp)
 target_include_directories(test_dht_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
 target_link_libraries(test_dht_consistent_hashing PRIVATE distributed_node_lib)
+
+# DHT Static Partitioning Benchmark
+add_executable(run_benchmark_static_partitioning benchmark/run_benchmark_static_partitioning.cpp)
+target_include_directories(run_benchmark_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
+target_link_libraries(run_benchmark_static_partitioning PRIVATE distributed_node_lib)
+
+# DHT Consistent Hashing Benchmark
+add_executable(run_benchmark_consistent_hashing benchmark/run_benchmark_consistent_hashing.cpp)
+target_include_directories(run_benchmark_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
+target_link_libraries(run_benchmark_consistent_hashing PRIVATE distributed_node_lib)

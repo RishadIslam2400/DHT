@@ -15,6 +15,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <memory>
+#include <iomanip>
 
 #include "concurrent_hash_table/striped_lock_concurrent_hash_table.h"
 #include "common/MurmurHash3.h"
@@ -27,6 +28,16 @@
  * of a Static Cluster (Config File).
  */
 
+struct NodeStats {
+    std::atomic<uint32_t> local_puts_success{0};
+    std::atomic<uint32_t> local_puts_failed{0};
+    std::atomic<uint32_t> local_gets_success{0};
+    std::atomic<uint32_t> local_gets_failed{0};
+
+    std::atomic<uint32_t> remote_puts{0};
+    std::atomic<uint32_t> remote_gets{0};
+};
+
 
 class ConsistentHashingDHTNode {
 private:
@@ -34,7 +45,6 @@ private:
 
     std::vector<NodeConfig> physical_nodes;
     std::map<uint64_t, NodeConfig> ring; // virtual nodes
-    // mutable std::shared_mutex ring_mutex;
     NodeConfig self_config;
     int num_virtual_nodes;
 
@@ -43,7 +53,8 @@ private:
     std::atomic<bool> benchmark_ready;
     std::thread listener_thread;
 
-    std::unique_ptr<ThreadPool> thread_pool;
+    // std::unique_ptr<ThreadPool> thread_pool;
+    NodeStats stats;
 
     void log_error(const char* prefix, int err) {
         char buf[1024];
@@ -151,16 +162,6 @@ private:
     }
 
     void handle_client(int client_socket) {
-        struct SockGuard {
-            int s;
-            ~SockGuard() {
-                close(s);
-            }
-        };
-
-        SockGuard guard;
-        guard.s = client_socket;
-
         std::string request;
         while(recv_framed(client_socket, request)) {
             std::string response = handle_request(request);
@@ -168,6 +169,8 @@ private:
                 break;
             }
         }
+
+        close(client_socket);
     }
 
     void listen_loop() {
@@ -216,18 +219,18 @@ private:
                 continue;
             }
 
-            /* std::thread([this, new_socket]() {
+            std::thread([this, new_socket]() {
                 this->handle_client(new_socket);
-            }).detach(); */
+            }).detach();
 
-            try {
+            /* try {
                 thread_pool->enqueue([this, new_socket] {
                     this->handle_client(new_socket);
                 });
             } catch (const std::exception& e) {
                 std::cerr << "ThreadPool enqueue failed: " << e.what() << "\n";
                 close(new_socket);
-            }
+            } */
         }
     }
 
@@ -257,10 +260,10 @@ public:
         }
 
         // Initialize threadpool
-        unsigned int threads = std::thread::hardware_concurrency();
+        /* unsigned int threads = std::thread::hardware_concurrency();
         if (threads == 0)
             threads = 4;
-        thread_pool = std::make_unique<ThreadPool>(threads);
+        thread_pool = std::make_unique<ThreadPool>(threads); */
 
         std::cout << "Booted Consistent Node " << my_id << " (" << self_config.ip << ")\n";
         std::cout << "Ring Topology: " << physical_nodes.size() << " Physical Nodes, " 
@@ -287,7 +290,7 @@ public:
             server_fd = -1;
         }
         if (listener_thread.joinable()) listener_thread.join();
-        thread_pool.reset();
+        // thread_pool.reset();
     }
 
     void wait_for_barrier() {
@@ -305,7 +308,7 @@ public:
                         ready_count++;
                 }
 
-                if (ready_count == physical_nodes.size() - 1) {
+                if (ready_count == static_cast<int>(physical_nodes.size()) - 1) {
                     std::cout << "[Coordinator] All peers online. Sending GO signal!\n";
                     break;
                 }
@@ -333,14 +336,18 @@ public:
 
     std::string put(int key, int value) {
         uint64_t key_hash = hash_key(key);
-
-        // Find successor will land on a Virtual Node, which maps to a Physical Node
         NodeConfig owner = find_successor(key_hash);
-
+        
         if (owner == self_config) {
-            storage.insert(key, value);
+            bool success = storage.put(key, value);
+            if (success) {
+                stats.local_puts_success++;
+            } else {
+                stats.local_puts_failed++;
+            }
             return "OK";
         } else {
+            stats.remote_puts++;
             std::string msg = "PUT " + std::to_string(key) + " " + std::to_string(value);
             return send_request(owner.ip, msg, owner.port);
         }
@@ -351,9 +358,16 @@ public:
         NodeConfig owner = find_successor(key_hash);
 
         if (owner == self_config) {
-            auto res = storage.search(key);
-            return res.has_value() ? std::to_string(res.value()) : "NOT FOUND";
+            auto res = storage.get(key);
+            if (res.has_value()) {
+                stats.local_gets_success++;
+                return std::to_string(res.value());
+            } else {
+                stats.local_gets_failed++;
+                return "NOT FOUND";
+            }
         } else {
+            stats.remote_gets++;
             return send_request(owner.ip, "GET " + std::to_string(key), owner.port);
         }
     }
@@ -401,7 +415,24 @@ public:
     }
 
     void print_status() {
-        storage.print_table();
+        // storage.print_table();
+        
+        uint32_t total_local_puts = stats.local_puts_success + stats.local_puts_failed;
+        uint32_t total_local_gets = stats.local_gets_success + stats.local_gets_failed;
+
+        std::cout << "\nNode " << self_config.id << " Statistics\n";
+        std::cout << "LOCAL STORAGE METRICS\n";
+        std::cout << "Local PUTs (Success/Insert): " << stats.local_puts_success << "\n";
+        std::cout << "Local PUTs (Fail/Update):    " << stats.local_puts_failed << "\n";
+        std::cout << "Total Local PUTs:            " << total_local_puts << "\n";
+        std::cout << "\n";
+        std::cout << "Local GETs (Success/Found):  " << stats.local_gets_success << "\n";
+        std::cout << "Local GETs (Fail/NotFound):  " << stats.local_gets_failed << "\n";
+        std::cout << "Total Local GETs:            " << total_local_gets << "\n";
+        
+        std::cout << "REMOTE TRAFFIC METRICS\n";
+        std::cout << "Remote PUTs Sent:            " << stats.remote_puts << "\n";
+        std::cout << "Remote GETs Sent:            " << stats.remote_gets << "\n";
     }
 
     void print_ring() {

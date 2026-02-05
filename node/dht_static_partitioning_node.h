@@ -16,11 +16,22 @@
 #include <cstring>
 #include <arpa/inet.h>
 #include <memory>
+#include <iomanip>
 
 #include "concurrent_hash_table/striped_lock_concurrent_hash_table.h"
 #include "common/MurmurHash3.h"
 #include "common/load_config.h"
 #include "common/threadpool.h"
+
+struct NodeStats {
+    std::atomic<uint32_t> local_puts_success{0};
+    std::atomic<uint32_t> local_puts_failed{0};
+    std::atomic<uint32_t> local_gets_success{0};
+    std::atomic<uint32_t> local_gets_failed{0};
+
+    std::atomic<uint32_t> remote_puts{0};
+    std::atomic<uint32_t> remote_gets{0};
+};
 
 class StaticClusterDHTNode {
 private:
@@ -34,6 +45,7 @@ private:
     std::thread listener_thread;
 
     // std::unique_ptr<ThreadPool> thread_pool;
+    NodeStats stats;
 
     void log_error(const char* prefix, int err) {
         char buf[1024];
@@ -132,22 +144,14 @@ private:
     }
 
     void handle_client(int client_socket) {
-        struct SockGuard {
-            int s;
-            ~SockGuard() {
-                close(s);
-            }
-        };
-
-        SockGuard guard;
-        guard.s = client_socket;
-
         std::string request;
         while (recv_framed(client_socket, request)) {
             std::string response = handle_request(request);
             if (!send_framed(client_socket, response))
                 break;
         }
+
+        close(client_socket);
     }
 
     void listen_loop() {
@@ -264,22 +268,36 @@ public:
         NodeConfig target = get_target_node(key);
 
         if (target.id == self_config.id) {
-            storage.insert(key, value);
+            bool success_op = storage.put(key, value);
+            if (success_op) {
+                stats.local_puts_success++;
+            } else {
+                stats.local_puts_failed++;
+            }
+
             return "OK";
         } else {
             // std::cout << "Routing " << key << " to Node " << target.id << "\n";
+            stats.remote_puts++;
             std::string msg = "PUT " + std::to_string(key) + " " + std::to_string(value);
             return send_request(target.ip, msg, target.port);
-        }
+        } 
     }
 
     std::string get(int key) {
         NodeConfig target = get_target_node(key);
 
         if (target.id == self_config.id) {
-            auto res = storage.search(key);
-            return res.has_value() ? std::to_string(res.value()) : "NOT FOUND";
+            auto res = storage.get(key);
+            if (res.has_value()) {
+                stats.local_gets_success++;
+                return std::to_string(res.value());
+            } else {
+                stats.local_gets_failed++;
+                return "NOT FOUND";
+            }
         } else {
+            stats.remote_gets++;
             return send_request(target.ip, "GET " + std::to_string(key), target.port);
         }
     }
@@ -364,6 +382,23 @@ public:
     }
 
     void print_status() {
-        storage.print_table();
+        // storage.print_table();
+        
+        uint32_t total_local_puts = stats.local_puts_success + stats.local_puts_failed;
+        uint32_t total_local_gets = stats.local_gets_success + stats.local_gets_failed;
+
+        std::cout << "\nNode " << self_config.id << " Statistics\n";
+        std::cout << "LOCAL STORAGE METRICS\n";
+        std::cout << "Local PUTs (Success/Insert): " << stats.local_puts_success << "\n";
+        std::cout << "Local PUTs (Fail/Update):    " << stats.local_puts_failed << "\n";
+        std::cout << "Total Local PUTs:            " << total_local_puts << "\n";
+        std::cout << "\n";
+        std::cout << "Local GETs (Success/Found):  " << stats.local_gets_success << "\n";
+        std::cout << "Local GETs (Fail/NotFound):  " << stats.local_gets_failed << "\n";
+        std::cout << "Total Local GETs:            " << total_local_gets << "\n";
+        
+        std::cout << "REMOTE TRAFFIC METRICS\n";
+        std::cout << "Remote PUTs Sent:            " << stats.remote_puts << "\n";
+        std::cout << "Remote GETs Sent:            " << stats.remote_gets << "\n";
     }
 };

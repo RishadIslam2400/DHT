@@ -1,5 +1,5 @@
 Booted Consistent Node 1 (128.180.120.66)
-Ring Topology: 3 Physical Nodes, 303 Virtual Nodes.
+Ring Topology: 3 Physical Nodes, 300 Virtual Nodes.
 [Worker] Waiting for Coordinator...
 Node listening on port 1895...
 [Worker] GO received!

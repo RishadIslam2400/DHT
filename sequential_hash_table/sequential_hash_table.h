@@ -71,7 +71,7 @@ public:
         table.resize(capacity);
     }
 
-    void insert(const K& key, const V& value) {
+    bool put(const K& key, const V& value) {
         if ((float)(count + 1) / capacity > load_factor) {
             resize();
         }
@@ -83,16 +83,17 @@ public:
         for (Ht_item<K, V>& item : bucket) {
             if (item.key == key) {
                 item.value = value;
-                return;
+                return false;
             }
         }
 
         // If not found, insert at the end of the bucket (handle collision)
         bucket.push_back({key, value});
         count++;
+        return true;
     }
 
-    std::optional<V> search(const K& key) {
+    std::optional<V> get(const K& key) {
         unsigned long index = hash_function(key, capacity);
         std::vector<Ht_item<K, V>> &bucket = table[index];
 

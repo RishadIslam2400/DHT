@@ -99,7 +99,7 @@ public:
         }
     }
 
-    void insert(const K& key, const V& value) {
+    bool put(const K& key, const V& value) {
         if ((float)(count) / capacity > load_factor) {
             resize();
         }
@@ -117,17 +117,18 @@ public:
         for (Ht_item<K, V>& item : bucket) {
             if (item.key == key) {
                 item.value = value;
-                return;
+                return false; // updated existing
             }
         }
 
         // If not found, insert at the end of the bucket (handle collision)
         bucket.push_back({key, value});
         count++;
+        return true;
     }
 
     // Reader lock here, allows concurrent reading by multiple threads
-    std::optional<V> search(const K& key) {
+    std::optional<V> get(const K& key) {
         uint64_t raw_hash = get_raw_hash(key);
         int lock_index = get_lock_index(raw_hash);
         std::shared_lock<std::shared_mutex> lock(*table_mutexes[lock_index]);

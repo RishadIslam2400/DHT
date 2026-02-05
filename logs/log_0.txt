@@ -1,8 +1,11 @@
+mv: cannot create regular file '/home/mds222/.config/Code/User/settings.json': File exists
+mv: preserving times for '/home/mds222/.vscode/argv.json': Stale file handle
+mv: preserving permissions for ‘/home/mds222/.vscode/argv.json’: Stale file handle
 Booted Consistent Node 0 (128.180.120.65)
-Ring Topology: 3 Physical Nodes, 303 Virtual Nodes.
+Ring Topology: 3 Physical Nodes, 300 Virtual Nodes.
 [Coordiator] Checking if ring peers are ready...
 Node listening on port 1895...
-[Coordinator] Waiting... (1/302)
+[Coordinator] Waiting... (1/2)
 [Coordinator] All peers online. Sending GO signal!
 
 >>> [Test] Starting 3-Node Verification on Node 0...
