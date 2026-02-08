@@ -27,21 +27,19 @@ add_library(common_utils STATIC
     common/MurmurHash3.h
     common/MurmurHash3.cpp
     common/xxHash.h
-    common/config_t.h
-    common/config_t.cc
-    common/load_config.h
+    common/node_properties.h
     common/threadpool.h
 )
 target_include_directories(common_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}) 
 target_link_libraries(common_utils PUBLIC Threads::Threads)
 
-add_library(distributed_node_lib INTERFACE)
-target_sources(distributed_node_lib INTERFACE
-    node/dht_consistent_hashing_node.h
-    node/dht_static_partitioning_node.h
+add_library(dht_lib INTERFACE)
+target_sources(dht_lib INTERFACE
+    dht/dht_consistent_hashing.h
+    dht/dht_static_partitioning.h
 )
-target_include_directories(distributed_node_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(distributed_node_lib INTERFACE common_utils)
+target_include_directories(dht_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(dht_lib INTERFACE common_utils)
 
 # Sequential Hash Table Test
 add_executable(seq_hash_table tests/test_sequential_hash_table.cpp)
@@ -60,20 +58,25 @@ target_include_directories(striped_lock_hash_table PRIVATE ${CMAKE_CURRENT_SOURC
 
 # DHT Static Partitioning Node Test
 add_executable(test_dht_static_partitioning tests/test_dht_static_partitioning.cpp)
-target_include_directories(test_dht_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(test_dht_static_partitioning PRIVATE distributed_node_lib)
+target_include_directories(test_dht_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+target_link_libraries(test_dht_static_partitioning PRIVATE dht_lib)
 
 # DHT Consistent Hashing Node Test
 add_executable(test_dht_consistent_hashing tests/test_dht_consistent_hashing.cpp)
-target_include_directories(test_dht_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(test_dht_consistent_hashing PRIVATE distributed_node_lib)
+target_include_directories(test_dht_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+target_link_libraries(test_dht_consistent_hashing PRIVATE dht_lib)
+
+# Connection Pool Test
+add_executable(test_connection_pool tests/test_connection_pool.cpp)
+target_include_directories(test_connection_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+target_link_libraries(test_connection_pool PRIVATE dht_lib)
 
 # DHT Static Partitioning Benchmark
 add_executable(run_benchmark_static_partitioning benchmark/run_benchmark_static_partitioning.cpp)
-target_include_directories(run_benchmark_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(run_benchmark_static_partitioning PRIVATE distributed_node_lib)
+target_include_directories(run_benchmark_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+target_link_libraries(run_benchmark_static_partitioning PRIVATE dht_lib)
 
 # DHT Consistent Hashing Benchmark
 add_executable(run_benchmark_consistent_hashing benchmark/run_benchmark_consistent_hashing.cpp)
-target_include_directories(run_benchmark_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/node)
-target_link_libraries(run_benchmark_consistent_hashing PRIVATE distributed_node_lib)
+target_include_directories(run_benchmark_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+target_link_libraries(run_benchmark_consistent_hashing PRIVATE dht_lib)

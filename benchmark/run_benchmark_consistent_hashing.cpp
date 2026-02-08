@@ -1,6 +1,7 @@
-#include "dht_consistent_hashing_node.h"
+#include "dht_consistent_hashing.h"
 
 #include <random>
+#include <iomanip>
 
 // Global Metrics
 std::atomic<uint64_t> total_latency_us{0};

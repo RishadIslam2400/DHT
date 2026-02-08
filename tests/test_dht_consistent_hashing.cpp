@@ -5,7 +5,7 @@
 #include <thread>
 #include <string>
 
-#include "dht_consistent_hashing_node.h"
+#include "dht_consistent_hashing.h"
 
 void run_correctness_test(ConsistentHashingDHTNode& node, int my_id) {
     std::cout << "\n>>> [Test] Starting 3-Node Verification on Node " << my_id << "...\n";

@@ -5,7 +5,7 @@
 #include <thread>
 #include <string>
 
-#include "dht_static_partitioning_node.h" 
+#include "dht_static_partitioning.h" 
 
 void run_correctness_test(StaticClusterDHTNode& node, int my_id) {
     std::cout << "\n>>> [Test] Starting 3-Node Verification on Node " << my_id << "...\n";
