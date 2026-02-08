@@ -200,7 +200,7 @@ function cl_benchmark() {
     mkdir -p "$LOG_DIR"
 
     KEY_RANGES=(10 100 1000 10000)
-    RUNS=3
+    RUNS=5
 
     echo "Starting Benchmark Suite: ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
 
