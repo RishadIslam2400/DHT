@@ -92,7 +92,7 @@ private:
     }
 
 public:
-    StripedLockConcurrentHashTable(int size = 10000, int locks = 64) : capacity(size), count(0), num_locks(locks) {
+    StripedLockConcurrentHashTable(int size = 1000, int locks = 64) : capacity(size), count(0), num_locks(locks) {
         table.resize(capacity);
         for (int i = 0; i < num_locks; ++i) {
             table_mutexes.push_back(std::make_unique<std::shared_mutex>());
