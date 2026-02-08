@@ -13,6 +13,9 @@ void worker(StaticClusterDHTNode* node, int ops_count, int key_range, int seed, 
     std::uniform_int_distribution<int> val_dist(1, 10000);
     std::uniform_int_distribution<int> op_dist(1, 100);
 
+    uint64_t local_latency_us = 0;
+    int local_ops_completed = 0;
+
     for (int i = 0; i < ops_count; ++i) {
         int key = key_dist(rng);
         bool is_put = op_dist(rng) <= put_prob;
@@ -29,9 +32,12 @@ void worker(StaticClusterDHTNode* node, int ops_count, int key_range, int seed, 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-        total_latency_us += duration;
-        total_ops_completed++;
+        local_latency_us += duration;
+        local_ops_completed++;
     }
+
+    total_latency_us += local_latency_us;
+    total_ops_completed += local_ops_completed;
 }
 
 int main(int argc, char** argv) {
