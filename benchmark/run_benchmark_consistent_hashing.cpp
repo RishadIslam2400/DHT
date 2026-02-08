@@ -4,40 +4,78 @@
 #include <iomanip>
 
 // Global Metrics
-std::atomic<uint64_t> total_latency_us{0};
+std::atomic<uint64_t> total_latency_ns{0};
 std::atomic<uint32_t> total_ops_completed{0};
 
-void worker(ConsistentHashingDHTNode* node, int ops_count, int key_range, int seed, int put_prob = 20) {
-    std::mt19937 rng(std::random_device{}() + seed);
+// Synchronization primitives for the barrier
+std::atomic<int> threads_ready_count{0};
+std::atomic<bool> start_benchmark_flag{false};
+
+// To store exact finish times per thread
+std::vector<std::chrono::high_resolution_clock::time_point> thread_end_times;
+
+struct OpData {
+    int key;
+    int val;
+    bool is_put;
+};
+
+void worker(ConsistentHashingDHTNode* node, int thread_id, int ops_count, 
+            int key_range, int seed, int put_prob = 20)
+{
+    std::vector<OpData> operations;
+    operations.reserve(ops_count);
+
+    std::mt19937 rng(seed);
     std::uniform_int_distribution<int> key_dist(0, key_range - 1);
     std::uniform_int_distribution<int> val_dist(1, 10000);
     std::uniform_int_distribution<int> op_dist(1, 100);
 
-    uint64_t local_latency_us = 0;
-    int local_ops_completed = 0;
-
     for (int i = 0; i < ops_count; ++i) {
-        int key = key_dist(rng);
-        bool is_put = op_dist(rng) <= put_prob;
+        OpData op;
+        op.key = key_dist(rng);
+        op.is_put = (op_dist(rng) <= put_prob);
+        if (op.is_put) {
+            op.val = val_dist(rng);
+        }
+        operations.push_back(op);
+    }
+
+    // Signal this thread is ready
+    threads_ready_count++;
+
+    // Spin wait until main thread signals start
+    // We use yield to be nice to the scheduler, but for strict benchmarking 
+    // on dedicated cores, a tight spin is sometimes preferred.
+    while(!start_benchmark_flag.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    uint64_t local_latency_ns = 0;
+
+    auto* ops_ptr = operations.data();
+    size_t n_ops = operations.size();
+
+    for (int i = 0; i < n_ops; ++i) {
+        const OpData &op = ops_ptr[i];
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        if (is_put) {
-            int val = val_dist(rng);
-            node->put(key, val);
+        if (op.is_put) {
+            node->put(op.key, op.val);
         } else {
-            node->get(key);
+            node->get(op.key);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
-        local_latency_us += duration;
-        local_ops_completed++;
+        local_latency_ns += duration;
     }
 
-    total_latency_us += local_latency_us;
-    total_ops_completed += local_ops_completed;
+    thread_end_times[thread_id] = std::chrono::high_resolution_clock::now();
+    total_latency_ns += local_latency_ns;
+    total_ops_completed += n_ops;
 }
 
 int main(int argc, char** argv) {
@@ -54,33 +92,53 @@ int main(int argc, char** argv) {
     int key_range = std::stoi(argv[5]);
     int num_ops_per_thread = total_num_ops / num_threads;
 
+    thread_end_times.resize(num_threads);
+
     try {
         ConsistentHashingDHTNode node(config_file, node_id);
         node.start();
         node.wait_for_barrier();
 
         if (node_id == 0) {
-            std::cout << "[TestApp] Barrier passed. Starting workload with Key Range: " << key_range << "\n";
+            std::cout << "[TestApp] Barrier passed. Preparing workload (" << total_num_ops << " ops)...\n";
         }
 
         std::vector<std::thread> workers;
-        auto global_start = std::chrono::high_resolution_clock::now();
 
+        // spawn threads they will wait at the barrier
         for (int i = 0; i < num_threads; ++i) {
             int seed = (node_id * 10000) + (i * 100) + std::time(nullptr);
-            workers.emplace_back(worker, &node, num_ops_per_thread, key_range, seed, 20);
+            workers.emplace_back(worker, &node, i, num_ops_per_thread, key_range, seed, 20);
         }
+
+        // wait for othre threads to finish data generation
+        while(threads_ready_count.load() < num_threads) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        std::cout << "[TestApp] All threads ready. Starting measurement.\n";
+
+        auto global_start = std::chrono::high_resolution_clock::now();
+        start_benchmark_flag.store(true, std::memory_order_release);
 
         for (auto& t : workers) {
             t.join();
         }
 
-        auto global_end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> total_wall_time = global_end - global_start;
+        // find the latest end time among all threads
+        auto latest_end = global_start;
+        for (const auto& t_end : thread_end_times) {
+            if (t_end > latest_end) {
+                latest_end = t_end;
+            }
+        }
+
+        std::chrono::duration<double> total_wall_time = latest_end- global_start;
 
         double total_ops = total_ops_completed.load();
         double throughput = total_ops / total_wall_time.count();
-        double avg_latency_us = (double)total_latency_us.load() / total_ops;
+        double avg_latency_ns = (double)total_latency_ns.load() / total_ops;
+        double avg_latency_us = avg_latency_ns / 1000.0;
 
         std::cout << "Benchmark RESULTS (Node " << node_id << ")\n";
         node.print_status(); 
