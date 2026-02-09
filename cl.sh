@@ -180,7 +180,6 @@ function reset() {
 function cl_benchmark() {
     EXE_NAME=$(basename "$1")
     NUM_OPS=$2
-    NUM_THREADS=$3
     
     if [[ -z "$1" || -z "$2" || -z "$3" ]]; then
         echo "Usage: ./cl.sh benchmark <exe> <ops> <threads>"
@@ -200,31 +199,36 @@ function cl_benchmark() {
     mkdir -p "$LOG_DIR"
 
     KEY_RANGES=(10 100 1000 10000)
+    THREAD_COUNTS=$(seq 1 8)
     RUNS=5
 
     echo "Starting Benchmark Suite: ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
 
     # 3. The Loop
     for range in "${KEY_RANGES[@]}"; do
-        for run in $(seq 1 $RUNS); do
-            echo "BENCHMARK: Range=$range, Run=$run/$RUNS"
-            
-            pids=""
-            for i in "${!MACHINES[@]}"; do
-                host="${MACHINES[$i]}"
+        for threads in $THREAD_COUNTS; do
+            echo "--- Configuration: Range=${range}, Threads=${threads} ---"
+
+            for run in $(seq 1 $RUNS); do
+                echo "BENCHMARK: Range=$range, Run=$run/$RUNS"
                 
-                CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${NUM_THREADS} ${range}"
+                pids=""
+                for i in "${!MACHINES[@]}"; do
+                    host="${MACHINES[$i]}"
+                    
+                    CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${threads} ${range}"
+                    
+                    LOG_FILE="${LOG_DIR}/R${range}_T${threads}_Run${run}_Node${i}.log"
+                    
+                    ssh "${USER}@${host}.${DOMAIN}" "$CMD" > "$LOG_FILE" 2>&1 &
+                    
+                    pids="$pids $!"
+                done
                 
-                LOG_FILE="${LOG_DIR}/R${range}_Run${run}_Node${i}.log"
-                
-                ssh "${USER}@${host}.${DOMAIN}" "$CMD" > "$LOG_FILE" 2>&1 &
-                
-                pids="$pids $!"
+                # Wait for all nodes to finish this specific run before continuing
+                wait $pids || true
+                echo "Run $run completed. Logs saved to $LOG_DIR"
             done
-            
-            # Wait for all nodes to finish this specific run before continuing
-            wait $pids || true
-            echo "Run $run completed. Logs saved to $LOG_DIR"
         done
     done
     echo "Benchmark Suite Completed."
@@ -251,7 +255,7 @@ elif [[ "$cmd" == "init-config" ]]; then
 elif [[ "$cmd" == "run" && "$count" -eq 5 ]]; then
 	cl_run "$2" "$3" "$4" "$5"
 elif [[ "$cmd" == "benchmark" && "$count" -eq 4 ]]; then
-    cl_benchmark "$2" "$3" "$4"
+    cl_benchmark "$2" "$3"
 elif [[ "$cmd" == "connect" && "$count" -eq 1 ]]; then
 	cl_connect
 elif [[ "$cmd" == "reset" && "$count" -eq 2 ]]; then
