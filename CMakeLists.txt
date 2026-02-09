@@ -29,6 +29,7 @@ add_library(common_utils STATIC
     common/xxHash.h
     common/node_properties.h
     common/threadpool.h
+    common/connection_pool.h
 )
 target_include_directories(common_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}) 
 target_link_libraries(common_utils PUBLIC Threads::Threads)
@@ -37,6 +38,8 @@ add_library(dht_lib INTERFACE)
 target_sources(dht_lib INTERFACE
     dht/dht_consistent_hashing.h
     dht/dht_static_partitioning.h
+    dht/dht_batching.h
+    dht/dht_common.h
 )
 target_include_directories(dht_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(dht_lib INTERFACE common_utils)
@@ -68,7 +71,7 @@ target_link_libraries(test_dht_consistent_hashing PRIVATE dht_lib)
 
 # Connection Pool Test
 add_executable(test_connection_pool tests/test_connection_pool.cpp)
-target_include_directories(test_connection_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+target_include_directories(test_connection_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
 target_link_libraries(test_connection_pool PRIVATE dht_lib)
 
 # DHT Static Partitioning Benchmark

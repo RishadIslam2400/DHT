@@ -23,29 +23,13 @@
 #include "concurrent_hash_table/striped_lock_concurrent_hash_table.h"
 #include "common/MurmurHash3.h"
 #include "common/node_properties.h"
+#include "dht_common.h"
 // #include "common/threadpool.h"
-
-enum CommandType : uint8_t {
-    CMD_PING = 0,
-    CMD_GO = 1,
-    CMD_PUT = 2,
-    CMD_GET = 3
-};
-
-struct RequestMsg {
-    CommandType cmd;
-    int32_t key;
-    int32_t value;
-};
-
-struct ResponseMsg {
-    uint8_t status;
-    int32_t value;
-};
 
 class StaticClusterDHTNode
 {
 private:
+    friend class StaticPartitioningBatching;
     StripedLockConcurrentHashTable<int, int> storage;
 
     std::vector<NodeConfig> cluster_map;
@@ -61,7 +45,6 @@ private:
     // Map: NodeID -> Queue of open socket file descriptors
     std::mutex connection_pool_mtx;
     std::unordered_map<int, std::queue<int>> connection_pool;
-
     
     // ------------------------------- Utility functions --------------------------------
     void log_error(const char* prefix, int err) {
@@ -78,18 +61,41 @@ private:
         return hash_out[0];
     }
 
+    // Overload for int types
     uint64_t hash_key(int key) {
-        return hash_key(std::to_string(key));
+        uint64_t hash_out[2];
+        MurmurHash3_x86_128(&key, sizeof(key), 2400, hash_out);
+        return hash_out[0];
     }
 
+    // Get the correct node for the key
     NodeConfig get_target_node(int key) {
         uint64_t hash_val = hash_key(key);
         size_t target_index = hash_val % cluster_map.size();
         return cluster_map[target_index];
     }
 
-    // ---------------------------- Client side operation -------------------------------
+    // Receive exactly 'n' bytes. Returns true on success, false on failure/close.
+    static bool recv_n_bytes(int sock, void* buffer, size_t n) {
+        size_t total_read = 0;
+        char *buf_ptr = static_cast<char *>(buffer);
+        while (total_read < n) {
+            ssize_t received = read(sock, buf_ptr + total_read, n - total_read);
+            if (received < 0) {
+                if (errno == EINTR)
+                    continue; // if the read call was interrupted then retry
+                return false;
+            }
+            // recieved EOF before reading n bytes, discard the message
+            if (received == 0)
+                return false;
+            total_read += received;
+        }
+        return true;
+    }
 
+    // ---------------------------- Client side operation -------------------------------
+    // Create a new connection with the target node
     int create_new_connection(const std::string& target_ip, int target_port) {
         sockaddr_in node_addr;
         memset(&node_addr, 0, sizeof(node_addr));
@@ -131,7 +137,6 @@ private:
         }
 
         // if pool empty, create new connection
-        // establish new connection after releasing the lock
         return create_new_connection(target_ip, target_port);
     }
 
@@ -145,7 +150,8 @@ private:
         }
     }
 
-    bool perform_rpc(int sock, const RequestMsg& req, ResponseMsg& resp) {
+    // Communication protocol for handling a single request
+    bool perform_rpc_single_request(int sock, const RequestMsg& req, ResponseMsg& resp) {
         uint8_t buffer[9];
         buffer[0] = req.cmd;
         std::memcpy(&buffer[1], &req.key, 4);
@@ -164,15 +170,14 @@ private:
     }
 
     // take active connections from pool to send request
-    ResponseMsg send_request_with_pool(int target_id, const std::string& target_ip, const RequestMsg& request, int target_port) {
-        // Try with a pooled socket
+    ResponseMsg send_single_request(int target_id, const std::string& target_ip, const RequestMsg& request, int target_port) {
         // Get a active connection from the pool or create a new connection
         int sock = get_socket_from_pool(target_id, target_ip, target_port);
         if (sock < 0)
             return ResponseMsg{0, 0};
 
         ResponseMsg response;
-        bool success = perform_rpc(sock, request, response);
+        bool success = perform_rpc_single_request(sock, request, response);
 
         if (success) {
             return_socket_to_pool(target_id, sock, false); // Return to pool
@@ -187,7 +192,7 @@ private:
         if (sock < 0)
             return ResponseMsg{0, 0};
 
-        success = perform_rpc(sock, request, response);
+        success = perform_rpc_single_request(sock, request, response);
         if (success) {
             return_socket_to_pool(target_id, sock, false); // New socket is good, pool it
             return response;
@@ -197,8 +202,71 @@ private:
         return ResponseMsg{0, 0};
     }
 
-    // ------------------------ Server side opeartion ---------------------------------
+    bool send_batch(int target_id, const std::string& target_ip, int target_port,
+                    const std::vector<RequestMsg>& batch_requests)
+    {
+        if (batch_requests.empty())
+            return true;
 
+        // Serialize all the requests into one large buffer
+        uint16_t batch_size = static_cast<uint16_t>(batch_requests.size());
+        size_t total_send_bytes = 3 + (batch_size * 9); // Size = 1 (CMD_BATCH) + 2 (COUNT) + (N * 9)
+        
+        uint8_t send_buffer[total_send_bytes];
+        uint8_t *buf_ptr = send_buffer;
+
+        // Write cmd and count
+        *buf_ptr = CMD_BATCH; 
+        buf_ptr++;
+
+        uint16_t batch_size_net = htons(batch_size);
+        std::memcpy(buf_ptr, &batch_size_net, 2);
+        buf_ptr += 2;
+
+        // Write requests
+        for (const RequestMsg& request : batch_requests) {
+            *buf_ptr = request.cmd;
+            std::memcpy(buf_ptr + 1, &request.key, 4);
+            std::memcpy(buf_ptr + 5, &request.value, 4);
+            buf_ptr += 9;
+        }
+
+        // Buffer to read all responses
+        size_t expected_response_bytes = batch_size * 5;
+        uint8_t recv_buffer[expected_response_bytes];
+
+        int sock = get_socket_from_pool(target_id, target_ip, target_port);
+        if (sock < 0)
+            return false;
+
+        // Send the entire batch and recieve response
+        if (send(sock, send_buffer, total_send_bytes, MSG_NOSIGNAL) == static_cast<ssize_t>(total_send_bytes)) {
+            if (recv_n_bytes(sock, recv_buffer, expected_response_bytes)) {
+                return_socket_to_pool(target_id, sock, false);
+                return true;
+            }
+        }
+
+        // Communication failure, destroy socket and try with a new socket
+        return_socket_to_pool(target_id, sock, true);
+
+        sock = create_new_connection(target_ip, target_port);
+        if (sock < 0)
+            return false;
+
+        if (send(sock, send_buffer, total_send_bytes, MSG_NOSIGNAL) == static_cast<ssize_t>(total_send_bytes)) {
+            if (recv_n_bytes(sock, recv_buffer, expected_response_bytes)) {
+                return_socket_to_pool(target_id, sock, false);
+                return true;
+            }
+        }
+
+        // Failed twice, destroy socket
+        return_socket_to_pool(target_id, sock, true);
+        return false;
+    }
+
+    // ------------------------ Server side opeartion ---------------------------------
     bool put_local(int key, int value) {
         bool success = storage.put(key, value);
         if (success) {
@@ -221,7 +289,7 @@ private:
         return res;
     }
 
-    // Process client request
+    // Process a single client request
     ResponseMsg handle_request(RequestMsg& request) {
         request.key = ntohl(request.key);
         request.value = ntohl(request.value);
@@ -250,54 +318,89 @@ private:
         return ResponseMsg{0, 0};
     }
 
-    // Receive exactly 'n' bytes. Returns true on success, false on failure/close.
-    static bool recv_n_bytes(int sock, void* buffer, size_t n) {
-        size_t total_read = 0;
-        char *buf_ptr = static_cast<char *>(buffer);
-        while (total_read < n) {
-            ssize_t received = read(sock, buf_ptr + total_read, n - total_read);
-            if (received < 0) {
-                if (errno == EINTR)
-                    continue; // if the read call was interrupted then retry
-                return false;
-            }
-            // recieved EOF before reading n bytes, discard the message
-            if (received == 0)
-                return false;
-            total_read += received;
-        }
-        return true;
-    }
-
     // Handle accepted client launched on a new thread
     void handle_client(int client_socket) {
-        uint8_t buffer[9]; // the request from the client should be 9 bytes: CMD key value
+        uint8_t req_buffer[BATCH_SIZE * 9];
+        uint8_t resp_buffer[BATCH_SIZE * 5];
+        uint8_t cmd_buf[1];
 
-        // Persistent loop to continue reading until the client sends requests
-        // Thread handling client blocks on read, wakes up when client sends message
-        // Exits the loop when client closes the connection
-        while (recv_n_bytes(client_socket, buffer, 9)) {
-            // Deserialize
-            RequestMsg request;
-            request.cmd = static_cast<CommandType>(buffer[0]);
-            std::memcpy(&request.key, &buffer[1], 4);
-            std::memcpy(&request.value, &buffer[5], 4);
 
-            ResponseMsg response = handle_request(request);
+        // Persistent loop to continue reading until the node stops running
+        while (running) {
+            // read the first byte for command type
+            if (!recv_n_bytes(client_socket, cmd_buf, 1)) {
+                break; 
+            }
 
-            // Serialize response
-            uint8_t response_buffer[5];
-            response_buffer[0] = response.status;
-            std::memcpy(&response_buffer[1], &response.value, 4);
+            // Both the batch request and single request has a command type in the first byte
+            CommandType cmd = static_cast<CommandType>(cmd_buf[0]);
 
-            if (send(client_socket, response_buffer, 5, MSG_NOSIGNAL) != 5) {
-                break; // Send failed, exit loop
+            if (cmd == CMD_BATCH) {
+                // Read Batch Count (2 bytes)
+                uint16_t batch_count_net;
+                if (!recv_n_bytes(client_socket, &batch_count_net, 2))
+                    break;
+                
+                uint16_t batch_count = ntohs(batch_count_net);
+                
+                // Read Payload (N * 9 bytes)
+                size_t total_req_bytes = batch_count * 9;
+                if (!recv_n_bytes(client_socket, req_buffer, total_req_bytes))
+                    break;
+
+                // Process Batch
+                uint8_t* req_ptr = req_buffer;
+                uint8_t* resp_ptr = resp_buffer;
+
+                for (int i = 0; i < batch_count; ++i) {
+                    RequestMsg req;
+                    req.cmd = static_cast<CommandType>(req_ptr[0]);
+                    std::memcpy(&req.key, req_ptr + 1, 4);
+                    std::memcpy(&req.value, req_ptr + 5, 4);
+                    
+                    ResponseMsg resp = handle_request(req);
+
+                    resp_ptr[0] = resp.status;
+                    std::memcpy(resp_ptr + 1, &resp.value, 4);
+
+                    req_ptr += 9;
+                    resp_ptr += 5;
+                }
+
+                // Send Batch Responses
+                size_t total_resp_bytes = batch_count * 5;
+                if (send(client_socket, resp_buffer, total_resp_bytes, MSG_NOSIGNAL) != total_resp_bytes)
+                    break;
+    
+            } else {
+                // We already have the CMD byte. Now read the Key (4) + Value (4) = 8 bytes.
+                uint8_t payload[8];
+                if (!recv_n_bytes(client_socket, payload, 8))
+                    break;
+
+                // Reconstruct Request
+                RequestMsg req;
+                req.cmd = cmd;
+                std::memcpy(&req.key, payload, 4);
+                std::memcpy(&req.value, payload + 4, 4);
+
+                // Execute
+                ResponseMsg resp = handle_request(req);
+
+                // Send Single Response (5 bytes)
+                uint8_t single_resp_buf[5];
+                single_resp_buf[0] = resp.status;
+                std::memcpy(single_resp_buf + 1, &resp.value, 4);
+
+                if (send(client_socket, single_resp_buf, 5, MSG_NOSIGNAL) != 5)
+                    break;
             }
         }
 
         close(client_socket); // client closed connection, clean up socket
     }
 
+    // Listener thread creates a server socket which is listening for incoming connections
     void listen_loop() {
         // create the socket
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -430,21 +533,21 @@ public:
         // thread_pool.reset();
     }
 
+    // This put API is for a single insert, batched insert in the batcher class PUT
     bool put(int key, int value) {
         NodeConfig target = get_target_node(key);
 
         if (target.id == self_config.id) {
             return put_local(key, value);
         } else {
-            stats.remote_puts++;
+            stats.remote_puts_success++;
 
             RequestMsg request;
-            request.cmd = CMD_PUT;
+            request.cmd = CommandType::CMD_PUT;
             request.key = htonl(key);
             request.value = htonl(value);
 
-            // uses connection pool to reuse open sockets with target node
-            ResponseMsg response = send_request_with_pool(target.id, target.ip, request, target.port);
+            ResponseMsg response = send_single_request(target.id, target.ip, request, target.port);
             
             if (response.status == 1) {
                 return true;
@@ -454,6 +557,7 @@ public:
         }
     }
 
+    // Single GET API, batcher uses the same GET
     std::optional<int> get(int key) {
         NodeConfig target = get_target_node(key);
 
@@ -463,12 +567,11 @@ public:
             stats.remote_gets++;
 
             RequestMsg request;
-            request.cmd = CMD_GET;
+            request.cmd = CommandType::CMD_GET;
             request.key = htonl(key);
             request.value = 0; // padding
             
-            // uses connection pool to reuse open sockets with target node
-            ResponseMsg response = send_request_with_pool(target.id, target.ip, request, target.port);
+            ResponseMsg response = send_single_request(target.id, target.ip, request, target.port);
 
             if (response.status == 1) {
                 return ntohl(response.value);
@@ -491,8 +594,8 @@ public:
                         continue;
 
                     // send a ping message to all the other nodes and get a response
-                    RequestMsg ping_msg{CMD_PING, 0, 0};
-                    ResponseMsg res = send_request_with_pool(node.id, node.ip, ping_msg, node.port);
+                    RequestMsg ping_msg{CommandType::CMD_PING, 0, 0};
+                    ResponseMsg res = send_single_request(node.id, node.ip, ping_msg, node.port);
                     
                     if (res.status == 1)
                         ready_count++;
@@ -513,8 +616,8 @@ public:
                 if (node.id == 0)
                     continue;
 
-                RequestMsg go_msg{CMD_GO, 0, 0};
-                send_request_with_pool(node.id, node.ip, go_msg, node.port);
+                RequestMsg go_msg{CommandType::CMD_GO, 0, 0};
+                send_single_request(node.id, node.ip, go_msg, node.port);
             }
             
             // other nodes set benchmark_ready to true after GO message
@@ -539,16 +642,17 @@ public:
 
         std::cout << "\nNode " << self_config.id << " Statistics\n";
         std::cout << "LOCAL STORAGE METRICS\n";
-        std::cout << "Local PUTs (Success/Insert): " << stats.local_puts_success << "\n";
-        std::cout << "Local PUTs (Fail/Update):    " << stats.local_puts_failed << "\n";
-        std::cout << "Total Local PUTs:            " << total_local_puts << "\n";
+        std::cout << "Local PUTs (Success/Insert):         " << stats.local_puts_success << "\n";
+        std::cout << "Local PUTs (Fail/Update):            " << stats.local_puts_failed << "\n";
+        std::cout << "Total Local PUTs:                    " << total_local_puts << "\n";
         std::cout << "\n";
-        std::cout << "Local GETs (Success/Found):  " << stats.local_gets_success << "\n";
-        std::cout << "Local GETs (Fail/NotFound):  " << stats.local_gets_failed << "\n";
-        std::cout << "Total Local GETs:            " << total_local_gets << "\n";
+        std::cout << "Local GETs (Success/Found):          " << stats.local_gets_success << "\n";
+        std::cout << "Local GETs (Fail/NotFound):          " << stats.local_gets_failed << "\n";
+        std::cout << "Total Local GETs:                    " << total_local_gets << "\n";
         
         std::cout << "REMOTE TRAFFIC METRICS\n";
-        std::cout << "Remote PUTs Sent:            " << stats.remote_puts << "\n";
-        std::cout << "Remote GETs Sent:            " << stats.remote_gets << "\n";
+        std::cout << "Remote PUTs Sent:                    " << stats.remote_puts_success << "\n";
+        std::cout << "Remote PUTs Failed (Network Error):  " << stats.remote_puts_failed << "\n";
+        std::cout << "Remote GETs Sent:                    " << stats.remote_gets << "\n";
     }
 };

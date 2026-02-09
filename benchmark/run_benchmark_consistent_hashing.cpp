@@ -1,4 +1,5 @@
 #include "dht_consistent_hashing.h"
+#include "dht_batching.h"
 
 #include <random>
 #include <iomanip>
@@ -56,15 +57,19 @@ void worker(ConsistentHashingDHTNode* node, int thread_id, int ops_count,
     auto* ops_ptr = operations.data();
     size_t n_ops = operations.size();
 
+    ConsistentHashingBatching batcher(*node, 128);
+
     for (int i = 0; i < n_ops; ++i) {
         const OpData &op = ops_ptr[i];
 
         auto start = std::chrono::high_resolution_clock::now();
 
         if (op.is_put) {
-            node->put(op.key, op.val);
+            // Use the batcher to put
+            batcher.put(op.key, op.val);
         } else {
-            node->get(op.key);
+            // the batcher get is same as dht get
+            batcher.get(op.key);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -72,6 +77,11 @@ void worker(ConsistentHashingDHTNode* node, int thread_id, int ops_count,
 
         local_latency_ns += duration;
     }
+
+    auto flush_start = std::chrono::high_resolution_clock::now();
+    batcher.flush_all();
+    auto flush_end = std::chrono::high_resolution_clock::now();
+    local_latency_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(flush_end - flush_start).count();
 
     thread_end_times[thread_id] = std::chrono::high_resolution_clock::now();
     total_latency_ns += local_latency_ns;

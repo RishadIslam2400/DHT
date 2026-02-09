@@ -18,6 +18,10 @@ struct Ht_item {
     V value;
 };
 
+struct alignas(64) AlignedLock {
+    std::shared_mutex mutex;
+};
+
 template <typename K, typename V>
 class StripedLockConcurrentHashTable {
 private:
@@ -26,7 +30,7 @@ private:
     std::atomic<int> count;
     constexpr static float load_factor = 0.75f;
     
-    mutable std::vector<std::unique_ptr<std::shared_mutex>> table_mutexes;
+    std::unique_ptr<AlignedLock[]> table_mutexes;
     int num_locks;
 
     // Encapsulated hash function to get the raw hash value
@@ -68,7 +72,7 @@ private:
         // acquire exclusive access to all the locks
         std::vector<std::unique_lock<std::shared_mutex>> locks;
         for (int i = 0; i < num_locks; ++i) {
-            locks.emplace_back(*table_mutexes[i]);
+            locks.emplace_back(table_mutexes[i].mutex);
         }
 
         // Check the load again if some other thread already resized
@@ -94,9 +98,7 @@ private:
 public:
     StripedLockConcurrentHashTable(int size = 1000, int locks = 64) : capacity(size), count(0), num_locks(locks) {
         table.resize(capacity);
-        for (int i = 0; i < num_locks; ++i) {
-            table_mutexes.push_back(std::make_unique<std::shared_mutex>());
-        }
+        table_mutexes = std::make_unique<AlignedLock[]>(num_locks);
     }
 
     bool put(const K& key, const V& value) {
@@ -107,7 +109,7 @@ public:
         // Acquire exclusive access to the specific lock
         uint64_t raw_hash = get_raw_hash(key);
         int lock_index = get_lock_index(raw_hash);
-        std::unique_lock<std::shared_mutex> lock(*table_mutexes[lock_index]);
+        std::unique_lock<std::shared_mutex> lock(table_mutexes[lock_index].mutex);
 
         // Insert into the specific bucket
         size_t bucket_index = get_bucket_index(raw_hash, capacity);
@@ -131,7 +133,7 @@ public:
     std::optional<V> get(const K& key) {
         uint64_t raw_hash = get_raw_hash(key);
         int lock_index = get_lock_index(raw_hash);
-        std::shared_lock<std::shared_mutex> lock(*table_mutexes[lock_index]);
+        std::shared_lock<std::shared_mutex> lock(table_mutexes[lock_index].mutex);
 
         size_t bucket_index = get_bucket_index(raw_hash, capacity);
         std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
@@ -149,7 +151,7 @@ public:
     void remove(const K& key) {
         uint64_t raw_hash = get_raw_hash(key);
         int lock_index = get_lock_index(raw_hash);
-        std::unique_lock<std::shared_mutex> lock(*table_mutexes[lock_index]);
+        std::unique_lock<std::shared_mutex> lock(table_mutexes[lock_index].mutex);
 
         size_t bucket_index = get_bucket_index(raw_hash, capacity);
         std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
@@ -174,7 +176,7 @@ public:
     void print_table() const {
         std::vector<std::shared_lock<std::shared_mutex>> locks;
         for (int i = 0; i < num_locks; ++i) {
-            locks.emplace_back(*table_mutexes[i]);
+            locks.emplace_back(table_mutexes[i].mutex);
         }
 
         std::cout << "\nHash Table (Size: " << capacity << ")\n-------------------\n";

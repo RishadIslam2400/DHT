@@ -22,7 +22,8 @@ struct NodeStats {
     std::atomic<uint32_t> local_gets_success{0};
     std::atomic<uint32_t> local_gets_failed{0};
 
-    std::atomic<uint32_t> remote_puts{0};
+    std::atomic<uint32_t> remote_puts_success{0};
+    std::atomic<uint32_t> remote_puts_failed{0};
     std::atomic<uint32_t> remote_gets{0};
 };
 
