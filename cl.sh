@@ -181,7 +181,7 @@ function cl_benchmark() {
     EXE_NAME=$(basename "$1")
     NUM_OPS=$2
     
-    if [[ -z "$1" || -z "$2" || -z "$3" ]]; then
+    if [[ -z "$1" || -z "$2" ]]; then
         echo "Usage: ./cl.sh benchmark <exe> <ops> <threads>"
         exit 1
     fi
