@@ -254,7 +254,7 @@ elif [[ "$cmd" == "init-config" ]]; then
     generate_cluster_config
 elif [[ "$cmd" == "run" && "$count" -eq 5 ]]; then
 	cl_run "$2" "$3" "$4" "$5"
-elif [[ "$cmd" == "benchmark" && "$count" -eq 4 ]]; then
+elif [[ "$cmd" == "benchmark" && "$count" -eq 3 ]]; then
     cl_benchmark "$2" "$3"
 elif [[ "$cmd" == "connect" && "$count" -eq 1 ]]; then
 	cl_connect
