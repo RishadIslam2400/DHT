@@ -1,14 +1,10 @@
 #pragma once
 
-#include <string>
-#include <vector>
-#include <iostream>
-#include <functional>
-#include <type_traits>
 #include <shared_mutex>
-#include <mutex>
 #include <optional>
-#include "../common/MurmurHash3.h"
+#include <mutex>
+
+//#include "common/MurmurHash3.h"
 
 template <typename K, typename V>
 struct Ht_item {
@@ -19,20 +15,22 @@ struct Ht_item {
 template <typename K, typename V>
 class GlobalLockConcurrentHashTable {
 private:
+    // Hash table variables
     std::vector<std::vector<Ht_item<K, V>>> table;
-    int capacity;
-    int count;
-    const float load_factor = 0.75f;
+    size_t capacity;
+    size_t count;
+    constexpr static float load_factor = 0.75f;
+
+    // Concurrency variables
     mutable std::shared_mutex table_mutex;
 
     // Encapsulated hash function
-    unsigned long hash_function(const K& key, int cap) const {
+    uint64_t get_raw_hash(const K& key) const {
         std::hash<K> hasher;
-
-        return hasher(key) % cap;
+        return hasher(key);
     }
 
-    int murmur_hash(const K& key, int cap) const {
+    /* uint64_t get_raw_murmur_hash(const K& key, int cap) const {
         uint32_t seed = 2400;
         uint64_t hash_output[2] = {0}; // 128 bit output buffer
         const void *data_ptr = nullptr;
@@ -49,19 +47,23 @@ private:
 
         MurmurHash3_x86_128(data_ptr, (int)len, seed, hash_output);
 
-        return hash_output[0] % cap;
+        return hash_output[0];
+    } */
+
+    size_t get_bucket_index(uint64_t raw_hash, size_t cap) const {
+        return raw_hash % cap;
     }
 
-
-    // no locks here, the thread already holds the lock
+    // put() already hold the unique lock for resizing
     void resize() {
         int new_capacity = 2 * capacity;
         std::vector<std::vector<Ht_item<K, V>>> temp_table(new_capacity);
 
-        for (const std::vector<Ht_item<K, V>>& bucket : table) {
-            for (const Ht_item<K, V>& item : bucket) {
-                unsigned long new_index = hash_function(item.key, new_capacity);
-                temp_table[new_index].push_back(item);
+        for (std::vector<Ht_item<K, V>>& bucket : table) {
+            for (Ht_item<K, V>& item : bucket) {
+                uint64_t raw_hash = get_raw_hash(item.key);
+                size_t new_index = get_bucket_index(raw_hash, new_capacity);
+                temp_table[new_index].push_back(std::move(item));
             }
         }
 
@@ -70,7 +72,7 @@ private:
     }
 
 public:
-    GlobalLockConcurrentHashTable(int size = 100) : capacity(size), count(0) {
+    GlobalLockConcurrentHashTable(int size = 1024) : capacity(size), count(0) {
         table.resize(capacity);
     }
 
@@ -78,12 +80,13 @@ public:
     bool put(const K& key, const V& value) {
         std::unique_lock<std::shared_mutex> lock(table_mutex);
 
-        if ((float)(count + 1) / capacity > load_factor) {
+        if ((float)count / capacity > load_factor) {
             resize();
         }
 
-        unsigned long index = hash_function(key, capacity);
-        std::vector<Ht_item<K, V>>& bucket = table[index];
+        uint64_t raw_hash = get_raw_hash(key);
+        size_t bucket_index = get_bucket_index(raw_hash, capacity);
+        std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
 
         // Check if key exists to update
         for (Ht_item<K, V>& item : bucket) {
@@ -93,20 +96,21 @@ public:
             }
         }
 
-        // If not found, insert at the end of the bucket (handle collision)
+        // If not found, insert at the end of the bucket
         bucket.push_back({key, value});
         count++;
         return true;
     }
 
     // Reader lock here, allows concurrent reading by multiple threads
-    std::optional<V> get(const K& key) {
+    std::optional<V> get(const K& key) const {
         std::shared_lock<std::shared_mutex> lock(table_mutex);
 
-        unsigned long index = hash_function(key, capacity);
-        std::vector<Ht_item<K, V>> &bucket = table[index];
+        uint64_t raw_hash = get_raw_hash(key);
+        size_t bucket_index = get_bucket_index(raw_hash, capacity);
+        const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
-        for (Ht_item<K, V>& item : bucket) {
+        for (const Ht_item<K, V>& item : bucket) {
             if (item.key == key) {
                 return item.value;
             }
@@ -119,8 +123,9 @@ public:
     void remove(const K& key) {
         std::unique_lock<std::shared_mutex> lock(table_mutex);
 
-        unsigned long index = hash_function(key, capacity);
-        std::vector<Ht_item<K, V>>& bucket = table[index];
+        uint64_t raw_hash = get_raw_hash(key);
+        size_t bucket_index = get_bucket_index(raw_hash, capacity);
+        std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
 
         for (auto it = bucket.begin(); it != bucket.end(); ++it) {
             if (it->key == key) {
@@ -131,19 +136,19 @@ public:
         }
     }
 
-    int get_capacity() const {
+    int get_capacity() const { 
         std::shared_lock<std::shared_mutex> lock(table_mutex);
-        return capacity;
+        return capacity; 
     }
 
-    int get_count() const {
+    int get_count() const { 
         std::shared_lock<std::shared_mutex> lock(table_mutex);
-        return count;
+        return count; 
     }
 
     void print_table() const {
         std::shared_lock<std::shared_mutex> lock(table_mutex);
-        std::cout << "\nHash Table (Size: " << capacity << ")\n-------------------\n";
+        std::cout << "\nHash Table (Size: " << capacity << ")\n";
         for (int i = 0; i < capacity; ++i) {
             if (!table[i].empty()) {
                 std::cout << "Index " << i << ": ";
@@ -153,6 +158,6 @@ public:
                 std::cout << "\n";
             }
         }
-        std::cout << "-------------------\n\n";
+        std::cout << "\n";
     }
 };

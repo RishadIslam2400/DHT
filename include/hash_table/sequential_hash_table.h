@@ -1,12 +1,11 @@
 #pragma once
 
-#include <string>
-#include <iostream>
 #include <vector>
-#include <functional>
-#include <type_traits>
+#include <cstdint>
 #include <optional>
-#include "../common/MurmurHash3.h"
+#include <iostream>
+
+//#include "common/MurmurHash3.h"
 
 template <typename K, typename V>
 struct Ht_item {
@@ -18,20 +17,18 @@ struct Ht_item {
 template <typename K, typename V>
 class SequentialHashTable {
 private:
+    // Hash table variables
     std::vector<std::vector<Ht_item<K, V>>> table;
-    int capacity;
-    int count;
+    size_t capacity;
+    size_t count;
+    constexpr static float load_factor = 0.75f;
 
-    const float load_factor = 0.75f;
-
-    // Encapsulated hash function
-    unsigned long hash_function(const K& key, int cap) const {
+    uint64_t get_raw_hash(const K& key) const {
         std::hash<K> hasher;
-
-        return hasher(key) % cap;
+        return hasher(key);
     }
 
-    int murmur_hash(const K& key, int cap) const {
+    /* uint64_t get_raw_murmur_hash(const K& key, int cap) const {
         uint32_t seed = 2400;
         uint64_t hash_output[2] = {0}; // 128 bit output buffer
         const void *data_ptr = nullptr;
@@ -48,17 +45,22 @@ private:
 
         MurmurHash3_x86_128(data_ptr, (int)len, seed, hash_output);
 
-        return hash_output[0] % cap;
+        return hash_output[0];
+    } */
+
+    size_t get_bucket_index(uint64_t raw_hash, size_t cap) const {
+        return raw_hash % static_cast<int>(cap);
     }
 
     void resize() {
         int new_capacity = 2 * capacity;
         std::vector<std::vector<Ht_item<K, V>>> temp_table(new_capacity);
 
-        for (const std::vector<Ht_item<K, V>>& bucket : table) {
-            for (const Ht_item<K, V>& item : bucket) {
-                unsigned long new_index = hash_function(item.key, new_capacity);
-                temp_table[new_index].push_back(item);
+        for (std::vector<Ht_item<K, V>>& bucket : table) {
+            for (Ht_item<K, V>& item : bucket) {
+                uint64_t raw_hash = get_raw_hash(item.key);
+                size_t new_index = get_bucket_index(raw_hash, new_capacity);
+                temp_table[new_index].push_back(std::move(item));
             }
         }
 
@@ -67,17 +69,18 @@ private:
     }
 
 public:
-    SequentialHashTable(int size = 100) : capacity(size), count(0) {
+    SequentialHashTable(size_t size = 1024) : capacity(size), count(0) {
         table.resize(capacity);
     }
 
     bool put(const K& key, const V& value) {
-        if ((float)(count + 1) / capacity > load_factor) {
+        if ((float)count / capacity > load_factor) {
             resize();
         }
 
-        unsigned long index = hash_function(key, capacity);
-        std::vector<Ht_item<K, V>>& bucket = table[index];
+        uint64_t raw_hash = get_raw_hash(key);
+        size_t bucket_index = get_bucket_index(raw_hash, capacity);
+        std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
 
         // Check if key exists to update
         for (Ht_item<K, V>& item : bucket) {
@@ -93,9 +96,10 @@ public:
         return true;
     }
 
-    std::optional<V> get(const K& key) {
-        unsigned long index = hash_function(key, capacity);
-        std::vector<Ht_item<K, V>> &bucket = table[index];
+    std::optional<V> get(const K& key) const {
+        uint64_t raw_hash = get_raw_hash(key);
+        size_t bucket_index = get_bucket_index(raw_hash, capacity);
+        const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
         for (Ht_item<K, V>& item : bucket) {
             if (item.key == key) {
@@ -107,26 +111,25 @@ public:
     }
 
     void remove(const K& key) {
-        unsigned long index = hash_function(key, capacity);
-        std::vector<Ht_item<K, V>> &bucket = table[index];
+        uint64_t raw_hash = get_raw_hash(key);
+        size_t bucket_index = get_bucket_index(raw_hash, capacity);
+        std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
         for (auto it = bucket.begin(); it != bucket.end(); ++it) {
             if (it->key == key) {
-                // vector::erase shifts subsequent elements left (O(N) of bucket size)
-                // but for small buckets, this is very fast.
-                bucket.erase(it);
+                bucket.erase(it); // Automatically shifts the values to the left
                 count--;
                 return;
             }
         }
     }
 
-    int get_capacity() const { return capacity; }
-    int get_count() const { return count; }
+    size_t get_capacity() const { return capacity; }
+    size_t get_count() const { return count; }
 
     void print_table() {
-        std::cout << "\nHash Table (Vector Buckets)\n-------------------\n";
-        for (int i = 0; i < capacity; ++i) {
+        std::cout << "\nHash Table (Vector Buckets)\n";
+        for (size_t i = 0; i < capacity; ++i) {
             if (!table[i].empty()) {
                 std::cout << "Index " << i << ": ";
                 for (const Ht_item<K, V>& item : table[i]) {
@@ -135,6 +138,6 @@ public:
                 std::cout << "\n";
             }
         }
-        std::cout << "-------------------\n\n";
+        std::cout << "\n";
     }
 };

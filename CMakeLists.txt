@@ -15,71 +15,50 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(MSVC)
     add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wno-unused-parameter)
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter)
     add_link_options(-static-libstdc++ -static-libgcc)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -DNDEBUG")
 endif()
 
 find_package(Threads REQUIRED)
+include_directories(include)
 
-add_library(common_utils STATIC
-    common/MurmurHash3.h
-    common/MurmurHash3.cpp
-    common/xxHash.h
-    common/node_properties.h
-    common/threadpool.h
-    common/connection_pool.h
+add_library(common_lib
+    src/common/MurmurHash3.cpp
 )
-target_include_directories(common_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}) 
-target_link_libraries(common_utils PUBLIC Threads::Threads)
 
-add_library(dht_lib INTERFACE)
-target_sources(dht_lib INTERFACE
-    dht/dht_consistent_hashing.h
-    dht/dht_static_partitioning.h
-    dht/dht_batching.h
-    dht/dht_common.h
+add_library(dht_lib 
+    src/dht/dht_static_partitioning.cpp
+    src/dht/node_properties.cpp
+    src/dht/dht_message_batcher.cpp
+    src/network/connection_pool.cpp
 )
-target_include_directories(dht_lib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(dht_lib INTERFACE common_utils)
+target_link_libraries(dht_lib PUBLIC common_lib Threads::Threads)
 
-# Sequential Hash Table Test
-add_executable(seq_hash_table tests/test_sequential_hash_table.cpp)
-target_link_libraries(seq_hash_table PRIVATE common_utils)
-target_include_directories(seq_hash_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sequential_hash_table)
+add_executable(test_striped_lock_hash_table tests/test_striped_lock_concurrent_hash_table.cpp)
 
-# Global Lock Test
-add_executable(global_lock_hash_table tests/test_global_lock_concurrent_hash_table.cpp)
-target_link_libraries(global_lock_hash_table PRIVATE common_utils)
-target_include_directories(global_lock_hash_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_hash_table)
+# # DHT Static Partitioning Test
+# add_executable(test_dht_static_partitioning tests/test_dht_static_partitioning.cpp)
+# target_include_directories(test_dht_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+# target_link_libraries(test_dht_static_partitioning PRIVATE dht_lib)
 
-# Striped Lock Test
-add_executable(striped_lock_hash_table tests/test_striped_lock_concurrent_hash_table.cpp)
-target_link_libraries(striped_lock_hash_table PRIVATE common_utils)
-target_include_directories(striped_lock_hash_table PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_hash_table)
+# # DHT Consistent Hashing Test
+# # add_executable(test_dht_consistent_hashing tests/test_dht_consistent_hashing.cpp)
+# # target_include_directories(test_dht_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+# # target_link_libraries(test_dht_consistent_hashing PRIVATE dht_lib)
 
-# DHT Static Partitioning Node Test
-add_executable(test_dht_static_partitioning tests/test_dht_static_partitioning.cpp)
-target_include_directories(test_dht_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
-target_link_libraries(test_dht_static_partitioning PRIVATE dht_lib)
+# # Connection Pool Test
+# # add_executable(test_connection_pool tests/test_connection_pool.cpp)
+# # target_include_directories(test_connection_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+# # target_link_libraries(test_connection_pool PRIVATE dht_lib)
 
-# DHT Consistent Hashing Node Test
-add_executable(test_dht_consistent_hashing tests/test_dht_consistent_hashing.cpp)
-target_include_directories(test_dht_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
-target_link_libraries(test_dht_consistent_hashing PRIVATE dht_lib)
+# # DHT Static Partitioning Benchmark
+# add_executable(run_benchmark_static_partitioning benchmark/run_benchmark_static_partitioning.cpp)
+# target_include_directories(run_benchmark_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+# target_link_libraries(run_benchmark_static_partitioning PRIVATE dht_lib)
 
-# Connection Pool Test
-add_executable(test_connection_pool tests/test_connection_pool.cpp)
-target_include_directories(test_connection_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
-target_link_libraries(test_connection_pool PRIVATE dht_lib)
-
-# DHT Static Partitioning Benchmark
-add_executable(run_benchmark_static_partitioning benchmark/run_benchmark_static_partitioning.cpp)
-target_include_directories(run_benchmark_static_partitioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
-target_link_libraries(run_benchmark_static_partitioning PRIVATE dht_lib)
-
-# DHT Consistent Hashing Benchmark
-add_executable(run_benchmark_consistent_hashing benchmark/run_benchmark_consistent_hashing.cpp)
-target_include_directories(run_benchmark_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
-target_link_libraries(run_benchmark_consistent_hashing PRIVATE dht_lib)
+# # DHT Consistent Hashing Benchmark
+# # add_executable(run_benchmark_consistent_hashing benchmark/run_benchmark_consistent_hashing.cpp)
+# # target_include_directories(run_benchmark_consistent_hashing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dht)
+# # target_link_libraries(run_benchmark_consistent_hashing PRIVATE dht_lib)
