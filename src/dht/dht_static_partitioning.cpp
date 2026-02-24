@@ -274,8 +274,10 @@ bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size
       return false;
     }
     // recieved EOF before reading n bytes, discard the message
-    if (received == 0)
+    if (received == 0) {
+      errno = ECONNRESET;
       return false;
+    }
     total_read += received;
   }
   return true;
