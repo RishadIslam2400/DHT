@@ -118,12 +118,8 @@ int main(int argc, char** argv) {
     size_t num_locks = total_peers * num_threads * 4;
     StaticClusterDHTNode node(cluster_map, self_config, key_range, num_locks);
 
-    node.start();
-
-    // Establish TCP connections before hitting the barrier
-    std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+    node.start(); 
     node.warmup_network(num_threads);
-
     node.wait_for_barrier();
 
     #ifndef NDEBUG
