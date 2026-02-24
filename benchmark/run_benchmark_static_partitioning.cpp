@@ -60,7 +60,7 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
   DHTMessageBatcher batcher(*node);
 
   auto start = std::chrono::high_resolution_clock::now();
-  for (int i = 0; i < n_ops; ++i) {
+  for (size_t i = 0; i < n_ops; ++i) {
     const OpData &op = ops_ptr[i];
 
     if (op.is_put) {

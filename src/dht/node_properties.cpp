@@ -5,7 +5,7 @@
 
 // format of the property file:
 // id ip_address port
-inline std::vector<NodeConfig> load_config(const std::string& filename) {
+std::vector<NodeConfig> load_config(const std::string& filename) {
     std::vector<NodeConfig> nodes;
     std::ifstream file(filename);
     if (!file.is_open()) {

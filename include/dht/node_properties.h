@@ -25,4 +25,4 @@ struct NodeStats {
   alignas(64) std::atomic<uint32_t> remote_gets_failed{0};
 };
 
-std::vector<NodeConfig> load_config(const std::string& filename);
+std::vector<NodeConfig> load_config(const std::string &filename);
