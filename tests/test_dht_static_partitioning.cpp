@@ -5,100 +5,152 @@
 #include <thread>
 #include <string>
 
-#include "dht_static_partitioning.h" 
+#include "dht/dht_static_partitioning.h"
 
-void run_correctness_test(StaticClusterDHTNode& node, int my_id) {
-    std::cout << "\n>>> [Test] Starting 3-Node Verification on Node " << my_id << "...\n";
-
-    // Test 1: Node 0 writes (1, 100)
-    if (my_id == 0) {
-        std::cout << "[Test] Node 0 performing PUT(1, 100)...\n";
-        bool res = node.put(1, 100);
-        std::cout << "[Test] Node 0 PUT result: " << std::boolalpha << res << "\n";
-    }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    // Everyone verifies Key 1
-    std::optional<int> val1 = node.get(1);
-    if (val1.has_value() && val1.value() == 100) {
-        std::cout << "[PASS] Node " << my_id << " read Key 1 correctly (Got: 100)\n";
-    } else {
-        if (!val1.has_value()) {
-            std::cout << "[FAIL] Node " << my_id << " failed Key 1 not found.\n";
-        } else {
-            std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 100, Got: " << val1.value() << "\n";
-        }
-    }
-
-    // Test 2: Node 1 writes (2, 200)
-    if (my_id == 1) {
-        std::cout << "[Test] Node 1 performing PUT(2, 200)...\n";
-        bool res = node.put(2, 200);
-        std::cout << "[Test] Node 1 PUT result: " << std::boolalpha << res << "\n";
-    }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    // Everyone verifies Key 2
-    std::optional<int> val2 = node.get(2);
-    if (val2.has_value() && val2.value() == 200) {
-        std::cout << "[PASS] Node " << my_id << " read Key 2 correctly (Got: 200)\n";
-    } else {
-        if (!val2.has_value()) {
-            std::cout << "[FAIL] Node " << my_id << " failed Key 1 not found.\n";
-        } else {
-            std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 200, Got: " << val2.value() << "\n";
-        }
-    }
-
-    // Test 3: Node 2 writes (3, 300)
-    if (my_id == 2) {
-        std::cout << "[Test] Node 2 performing PUT(3, 300)...\n";
-        bool res = node.put(3, 300);
-        std::cout << "[Test] Node 2 PUT result: " << std::boolalpha << res << "\n";
-    }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    // Everyone verifies Key 3
-    std::optional<int> val3 = node.get(3);
-    if (val3.has_value() && val3.value() == 300) {
-        std::cout << "[PASS] Node " << my_id << " read Key 3 correctly (Got: 300)\n";
-    } else {
-        if (!val3.has_value()) {
-            std::cout << "[FAIL] Node " << my_id << " failed Key 1 not found.\n";
-        } else {
-            std::cout << "[FAIL] Node " << my_id << " failed Key 1. Expected: 300, Got: " << val3.value() << "\n";
-        }
-    }
-
-    std::cout << ">>> [Test] Verification Complete for Node " << my_id << ".\n\n";
+void log(const std::string& msg) {
+  std::cout << "[TEST] " << msg << std::endl;
 }
 
-int main(int argc, char** argv) {
-    // Arguments from cl.sh: <config_file> <node_id> <ops> <threads> <range>
-    if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <config_file> <node_id> ...\n";
-        return 1;
+// Helper to find a key that mathematically maps to a specific target node
+uint32_t find_key_for_node(StaticClusterDHTNode& node, int target_id) {
+  for (uint32_t i = 0; i < 100000; ++i) {
+    if (node.get_target_node(i).id == target_id) {
+      return i;
     }
+  }
+  throw std::runtime_error("Could not find key for target node");
+}
 
-    std::string config_file = argv[1];
-    int node_id = std::stoi(argv[2]);
+void test_local_routing(StaticClusterDHTNode& node0) {
+  log("Running Local Routing Test...");
+  uint32_t local_key = find_key_for_node(node0, 0);
+  
+  // Test Insert
+  PutResult put_res = node0.put(local_key, 999);
+  assert(put_res == PutResult::Inserted);
+  
+  // Test Update
+  put_res = node0.put(local_key, 1000);
+  assert(put_res == PutResult::Updated);
+  
+  // Test Retrieve
+  GetResponse get_res = node0.get(local_key);
+  assert(get_res.status == GetStatus::Found);
+  assert(get_res.value == 1000);
+  
+  // Test Missing
+  uint32_t missing_local_key = find_key_for_node(node0, 0);
+  while (missing_local_key == local_key) {
+    missing_local_key++; // Ensure different key
+  }
+  if (node0.get_target_node(missing_local_key).id == 0) {
+    GetResponse miss_res = node0.get(missing_local_key);
+    assert(miss_res.status == GetStatus::NotFound);
+  }
+  
+  log("Local Routing Test Passed!");
+}
 
-    try {
-        StaticClusterDHTNode node(config_file, node_id);
+void test_remote_single_rpc(StaticClusterDHTNode& node0, StaticClusterDHTNode& node1) {
+  log("Running Remote Single RPC Test...");
+  // Find a key that belongs to Node 1
+  uint32_t remote_key = find_key_for_node(node0, 1);
+  
+  // Node 0 issues a PUT. It should route over TCP to Node 1.
+  PutResult put_res = node0.put(remote_key, 5555);
+  assert(put_res == PutResult::Inserted);
+  
+  // Node 0 issues a GET. It should fetch over TCP from Node 1.
+  GetResponse get_res = node0.get(remote_key);
+  assert(get_res.status == GetStatus::Found);
+  assert(get_res.value == 5555);
+  
+  // Verify Node 1 actually holds the data locally
+  get_res = node1.get(remote_key);
+  assert(get_res.status == GetStatus::Found);
+  assert(get_res.value == 5555);
+  
+  log("Remote Single RPC Test Passed!");
+}
 
-        node.start();
-        node.wait_for_barrier();
-        run_correctness_test(node, node_id);
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        node.stop();
-
-    } catch (const std::exception& e) {
-        std::cerr << "[Fatal Error] " << e.what() << std::endl;
-        return 1;
+void test_remote_batch_rpc(StaticClusterDHTNode& node0, StaticClusterDHTNode& node1) {
+  log("Running Remote Batch RPC Test...");
+  
+  std::vector<PutRequest> batch;
+  // Generate 10 distinct keys that belong to Node 1
+  uint32_t k = 0;
+  while (batch.size() < 10) {
+    if (node0.get_target_node(k).id == 1) {
+      batch.push_back({k, k * 2});
     }
+    k++;
+  }
+  
+  // Send the batch directly using Node 0's internal network API
+  bool success = node0.send_batch(1, "127.0.0.1", 50001, batch);
+  assert(success == true);
+  
+  // Give the receiver thread on Node 1 a few milliseconds to process the batch
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  
+  // Verify Node 1 successfully unpacked and stored all 10 keys
+  for (const auto& req : batch) {
+    GetResponse res = node1.get(req.key);
+    assert(res.status == GetStatus::Found);
+    assert(res.value == req.value);
+  }
+  
+  log("Remote Batch RPC Test Passed!");
+}
 
-    return 0;
+void test_distributed_barrier(StaticClusterDHTNode& node0, StaticClusterDHTNode& node1) {
+  log("Running Distributed Barrier Test...");
+  
+  // Run the barriers on background threads so they don't block the test suite
+  std::thread t0([&]() { node0.wait_for_barrier(); });
+  std::thread t1([&]() { node1.wait_for_barrier(); });
+  
+  t0.join();
+  t1.join();
+  
+  // Both nodes should now have the atomic benchmark_ready flag set to true
+  assert(node0.benchmark_ready.load() == true);
+  assert(node1.benchmark_ready.load() == true);
+  
+  log("Distributed Barrier Test Passed!");
+}
+
+int main() {
+  std::vector<NodeConfig> cluster_map = {
+    {0, "127.0.0.1", 50000},
+    {1, "127.0.0.1", 50001}
+  };
+
+  StaticClusterDHTNode node0(cluster_map, cluster_map[0], 1024, 16);
+  StaticClusterDHTNode node1(cluster_map, cluster_map[1], 1024, 16);
+
+  try {
+    node0.start();
+    node1.start();
+
+    // Wait for sockets to fully bind
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Pre-warm the network (using 2 connections per peer for the test)
+    node0.warmup_network(2);
+    node1.warmup_network(2);
+
+    // Execute Test Suite
+    test_local_routing(node0);
+    test_remote_single_rpc(node0, node1);
+    test_remote_batch_rpc(node0, node1);
+    test_distributed_barrier(node0, node1);
+    
+    std::cout << "\nAll DHT integration tests passed successfully.\n";
+  } catch (const std::exception& e) {
+    std::cerr << "Test failed with exception: " << e.what() << "\n";
+  }
+
+  node0.stop();
+  node0.stop();
 }

@@ -1,5 +1,6 @@
 #include "dht/dht_static_partitioning.h"
 #include "common/xxHash64.h"
+#include "common/utils.h"
 
 #include <cstring>
 #include <unistd.h>
@@ -15,10 +16,11 @@ StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConf
     storage{hash_table_size, num_locks},
     server_fd{-1},
     running{false},
+    connection_pool(cluster_map.size()),
     benchmark_ready{false}
 {  
   std::cout << "Booted Node " << self_config.id 
-            << " (" << self_config.ip << ":" << self_config.port << ")\n";
+            << " (" << self_config.ip << ":" << self_config.port << ")" << std::endl;
 }
 
 StaticClusterDHTNode::~StaticClusterDHTNode() {
@@ -30,7 +32,22 @@ void StaticClusterDHTNode::start() {
   listener_thread = std::thread(&StaticClusterDHTNode::listen_loop, this);
 }
 
-void StaticClusterDHTNode::stop() {
+void StaticClusterDHTNode::warmup_network(int connections_per_peer) {
+  std::cout << "[Node " << self_config.id << "] Pre-warming " 
+            << connections_per_peer << " connections to each peer..." << std::endl;
+  
+  for (NodeConfig& peer : cluster_map) {
+    if (peer.id == self_config.id)
+      continue;
+
+    connection_pool.pre_warm(peer.id, peer.ip, peer.port, connections_per_peer);
+  }
+
+  std::cout << "[Node " << self_config.id << "] Network pre-warm complete." << std::endl;
+}
+
+void StaticClusterDHTNode::stop()
+{
   if (!running)
     return;
     
@@ -160,7 +177,7 @@ void StaticClusterDHTNode::wait_for_barrier() {
     std::cout << "[Coordinator] Barrier initiated. Waiting for pings from peers...\n";
     size_t total_peers = cluster_map.size() - 1;
 
-    // Block and wait for N-1 workers to send CMD_PING
+    // Block and wait for N-1 workers to check in
     {
       std::unique_lock<std::mutex> lock(barrier_mtx);
       barrier_cv.wait(lock, [&] {
@@ -171,40 +188,40 @@ void StaticClusterDHTNode::wait_for_barrier() {
     if (!running)
       return;
 
-    // Broadcast GO signal to all workers in parallel
-    std::cout << "[Coordinator] All peers reached barrier. Broadcasting GO signal...\n";
-    std::vector<std::thread> go_threads;
-    
+    // Broadcast GO signal to all workers
+    std::cout << "[Coordinator] All peers checked in. Fetching sockets...\n";
+
+    // use the warm up connections from the connections from connection_pool
+    std::vector<std::pair<int, int>> barrier_sockets;
+    barrier_sockets.reserve(total_peers);
+
     for (const NodeConfig& node : cluster_map) {
       if (node.id == 0)
         continue;
 
-      go_threads.emplace_back([this, node]() {
-        uint8_t response = 0;
-        bool success = false;
-
-        // keep retrying until success
-        while (this->running) {
-          success = this->send_single_request(node.id, node.ip, node.port, CommandType::CMD_GO, nullptr, 0, &response, 1);
-
-          if (success && response == 1) {
-            break; 
-          }
-
-          // If network failed, or response was wrong, wait and try again
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-      });
-    }
-
-    for (auto& t : go_threads) {
-      if (t.joinable()) {
-        t.join();
+      int sock = connection_pool.get_connection(node.id, node.ip, node.port);
+      if (sock != -1) {
+        barrier_sockets.push_back({node.id, sock});
+      } else {
+        std::cerr << "[Coordinator] CRITICAL: Failed to get pre-warmed socket for Node " << node.id << "\n";
       }
     }
 
+    std::cout << "[Coordinator] Broadcasting GO signal...\n";
+    uint8_t go_signal = 1;
+    for (const auto& peer : barrier_sockets) {
+      if (send(peer.second, &go_signal, 1, MSG_NOSIGNAL) != 1) {
+        log_error("Failed to send go signal", errno);
+      }
+    }
+
+    // Return sockets to the pool for the benchmark
+    for (const auto& peer : barrier_sockets) {
+      connection_pool.return_connection(peer.first, peer.second, false);
+    }
+
     // other nodes set benchmark_ready to true after GO message
-    benchmark_ready = true;
+    benchmark_ready.store(true, std::memory_order_release);
   } else { // Worker logic
     std::cout << "[Worker] Reached barrier. Notifying Coordinator...\n";
 
@@ -218,7 +235,12 @@ void StaticClusterDHTNode::wait_for_barrier() {
 
     bool success = false;
     while (running) {
-      success = send_single_request(coord.id, coord.ip, coord.port, CommandType::CMD_BARRIER, buf, 4, &response, 1);
+      // Use the pre-warmed pool for the check-in as well
+      int sock = connection_pool.get_connection(coord.id, coord.ip, coord.port);
+      if (sock != -1) {
+        success = send_single_request(coord.id, coord.ip, coord.port, CommandType::CMD_BARRIER, buf, 4, &response, 1);
+        connection_pool.return_connection(coord.id, sock, !success);
+      }
       if (success && response == 1) {
         std::cout << "[Worker] Coordinator got checkin notification. Waiting for GO...\n";
         break;
@@ -229,20 +251,17 @@ void StaticClusterDHTNode::wait_for_barrier() {
     }
 
     // wait until GO command and set benchmark_ready 
-    while (running && !benchmark_ready) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    while (running && !benchmark_ready.load(std::memory_order_acquire)) {
+      #if defined(__x86_64__)
+        __builtin_ia32_pause();
+      #else
+        std::this_thread::yield();
+      #endif
     }
   }
 }
 
 // -------------------------------Utility Functions------------------------------------
-void StaticClusterDHTNode::log_error(const char* prefix, int err) {
-  char buf[1024];
-  std::cerr << "[Error] " << prefix << " " 
-            << strerror_r(err, buf, sizeof(buf))
-            << std::endl;
-}
-
 // Receive exactly 'n' bytes. Returns true on success, false on failure/close.
 bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size_t n) {
   size_t total_read = 0;
@@ -488,7 +507,9 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
   while (running) {
     // Both the batch request and single request has a command type in the first byte
     if (!recv_n_bytes(client_socket, &cmd_buf, 1)) {
-      log_error("Could not read command byte", errno);
+      #ifndef NDEBUG
+        log_error("Could not read command byte", errno);
+      #endif
       break;
     }
 
@@ -741,6 +762,15 @@ void StaticClusterDHTNode::listen_loop() {
     std::cout << "Connected to "
               << inet_ntop(AF_INET, &client_addr.sin_addr, clientname, sizeof(clientname))
               << std::endl;
+
+    std::thread client_thread(&StaticClusterDHTNode::handle_client, this, new_socket);
+    
+    // Safely track the socket and thread for graceful shutdown
+    {
+      std::lock_guard<std::mutex> lock(thread_mutex);
+      active_sockets.push_back(new_socket);
+      client_threads.push_back(std::move(client_thread));
+    }
 
     // TODO: implement a threadpool instead of thread per connection
     // threadpool();

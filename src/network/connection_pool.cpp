@@ -1,4 +1,5 @@
 #include "network/connection_pool.h"
+#include "common/utils.h"
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -7,69 +8,91 @@
 #include <unistd.h>
 
 // Constructor and destructor
-ConnectionPool::ConnectionPool() {}
+ConnectionPool::ConnectionPool(int num_nodes) : pools(num_nodes) {}
 
 ConnectionPool::~ConnectionPool() {
-    std::lock_guard<std::mutex> lock(pool_mutex);
-    for (auto& entry : pool) {
-        while (!entry.second.empty()) {
-            close(entry.second.front());
-            entry.second.pop();
-        }
+  for (TargetPool& target_pool : pools) {
+    std::lock_guard<std::mutex> lock(target_pool.mtx);
+    for (int sock : target_pool.sockets) {
+      close(sock);
     }
+    target_pool.sockets.clear();
+  }
 }
 
 // Create a new connection with the target node
-int ConnectionPool::create_new_connection(const std::string& target_ip, int target_port) {
-    sockaddr_in node_addr;
-    memset(&node_addr, 0, sizeof(node_addr));
-    node_addr.sin_family = AF_INET;
-    node_addr.sin_port = htons(target_port);
-    if (inet_pton(AF_INET, target_ip.c_str(), &node_addr.sin_addr) <= 0)
-        return -1;
+int ConnectionPool::create_new_connection(const std::string &target_ip, const int target_port) {
+  sockaddr_in node_addr;
+  memset(&node_addr, 0, sizeof(node_addr));
+  node_addr.sin_family = AF_INET;
+  node_addr.sin_port = htons(target_port);
+  if (inet_pton(AF_INET, target_ip.c_str(), &node_addr.sin_addr) <= 0) {
+    log_error("Could not process ip address", errno);
+    return -1;
+  }
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-        return -1;
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) {
+    log_error("Invalid Socket", errno);
+    return -1;
+  }
 
-    struct timeval timeout;
-    timeout.tv_sec = 2; timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  struct timeval timeout;
+  timeout.tv_sec = 2; timeout.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    int opt = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+  int opt = 1;
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) < 0) {
-        close(sock);
-        return -1;
-    }
-    return sock;
+  if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) < 0) {
+    log_error("Connection failure", errno);
+    close(sock);
+    return -1;
+  }
+  return sock;
 }
 
 // Check if the queue has an idle socket. If yes, pop it. If no, create a new one.
-int ConnectionPool::get_connection(int target_id, const std::string& target_ip, int target_port) {
-    // try to pop from pool
-    {
-        std::unique_lock<std::mutex> lock(pool_mutex);
-        // check if connection exists, if yes reuse connection and remove from pool
-        if (pool.count(target_id) && !pool[target_id].empty()) {
-            int sock = pool[target_id].front();
-            pool[target_id].pop();
-            return sock;
-        }
-    }
+int ConnectionPool::get_connection(const int target_id, const std::string &target_ip, const int target_port) {
+  // try to pop from pool
+  {
+    std::unique_lock<std::mutex> lock(pools[target_id].mtx);
 
-    // if pool empty, create new connection
-    return create_new_connection(target_ip, target_port);
+    if (!pools[target_id].sockets.empty()) {
+      int sock = pools[target_id].sockets.back(); // Get recently used connection
+      pools[target_id].sockets.pop_back();
+      return sock;
+    }
+  }
+
+  // Pool empty or target queue empty, create new connection
+  return create_new_connection(target_ip, target_port);
 }
 
 // Return socket to pool for reuse or destroy if broken
-void ConnectionPool::return_connection(int target_id, int sock, const bool destroy) {
-    if (destroy) {
-        close(sock);
-    } else {
-        std::lock_guard<std::mutex> lock{pool_mutex};
-        pool[target_id].push(sock);
+void ConnectionPool::return_connection(const int target_id, const int sock, const bool destroy) {
+  if (destroy) {
+    close(sock);
+    return;
+  }
+  
+  std::unique_lock<std::mutex> lock(pools[target_id].mtx);
+  
+  // Bounds checking: Prevent File Descriptor Exhaustion
+  if (pools[target_id].sockets.size() >= MAX_SOCKETS_PER_NODE) {
+    lock.unlock();
+    close(sock);
+  } else {
+    pools[target_id].sockets.push_back(sock);
+  }
+}
+
+void ConnectionPool::pre_warm(const int target_id, const std::string &target_ip, const int target_port, const int count) {
+  for (int i = 0; i < count; ++i) {
+    int sock = create_new_connection(target_ip, target_port);
+    if (sock != -1) {
+      return_connection(target_id, sock, false);
     }
+  }
 }

@@ -40,7 +40,6 @@ private:
   std::set<int> barrier_checkins;    // Tracks which nodes have pinged
   std::atomic<bool> benchmark_ready; // Flag to control benchmarking4
 
-  void log_error(const char *prefix, int err);
   inline uint64_t hash_key(const std::string &key) const;              // returns raw hsah value of the key
   inline uint64_t hash_key(const uint32_t &key) const;                 // int overload
   inline const NodeConfig &get_target_node(const uint32_t &key) const; // get the node id for the key
@@ -64,6 +63,7 @@ public:
   mutable NodeStats stats;                                    // stats for bechmarking
 
   void start();        // start the server
+  void warmup_network(int connections_per_peer); // Warm up the connection_pool
   void stop();         // stop the server
   void print_status(); // print the stats
 
