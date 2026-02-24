@@ -182,7 +182,7 @@ function cl_benchmark() {
     NUM_OPS=$2
     
     if [[ -z "$1" || -z "$2" ]]; then
-        echo "Usage: ./cl.sh benchmark <exe> <ops> <threads>"
+        echo "Usage: ./cl.sh benchmark <exe> <ops>"
         exit 1
     fi
 
@@ -200,7 +200,7 @@ function cl_benchmark() {
 
     KEY_RANGES=(10 100 1000 10000)
     THREAD_COUNTS=$(seq 1 8)
-    RUNS=5
+    RUNS=1
 
     echo "Starting Benchmark Suite: ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
 

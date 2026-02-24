@@ -6,6 +6,8 @@
 #include <cstring>
 #include <netinet/tcp.h>
 #include <unistd.h>
+#include <iostream>
+#include <thread>
 
 // Constructor and destructor
 ConnectionPool::ConnectionPool(int num_nodes) : pools(num_nodes) {}
@@ -89,10 +91,35 @@ void ConnectionPool::return_connection(const int target_id, const int sock, cons
 }
 
 void ConnectionPool::pre_warm(const int target_id, const std::string &target_ip, const int target_port, const int count) {
-  for (int i = 0; i < count; ++i) {
+  std::vector<int> temp_sockets;
+  temp_sockets.reserve(count);
+
+  bool logged_waiting = false;
+
+  // Actively poll until the exact number of connections are established
+  while (temp_sockets.size() < static_cast<size_t>(count)) {
     int sock = create_new_connection(target_ip, target_port);
+    
     if (sock != -1) {
-      return_connection(target_id, sock, false);
+      temp_sockets.push_back(sock);
+    } else {
+      // Only log the warning once to avoid spamming the console
+      if (!logged_waiting) {
+        std::cout << "[ConnectionPool] Waiting for Node " << target_id 
+                  << " (" << target_ip << ":" << target_port << ") to come online...\n";
+        logged_waiting = true;
+      }
+      // Sleep briefly to avoid blasting the network with SYN packets
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+  }
+
+  if (logged_waiting) {
+    std::cout << "[ConnectionPool] Node " << target_id << " is online. Connections established.\n";
+  }
+
+  // Return all successfully established hot sockets to the LIFO stack
+  for (int sock : temp_sockets) {
+    return_connection(target_id, sock, false);
   }
 }
