@@ -113,7 +113,7 @@ public:
 
   bool put(const K& key, const V& value) {
     /* if ((float)(count.load()) / capacity.load() > load_factor) {
-        resize();
+      resize();
     } */
 
     uint64_t raw_hash = get_raw_hash(key);
@@ -143,86 +143,95 @@ public:
   }
 
   std::optional<V> get(const K& key) const {
-      uint64_t raw_hash = get_raw_hash(key);
-      // int current_cap = capacity.load();
-      size_t bucket_index = get_bucket_index(raw_hash);
-      int lock_index = get_lock_index(bucket_index);
+    uint64_t raw_hash = get_raw_hash(key);
+    // int current_cap = capacity.load();
+    size_t bucket_index = get_bucket_index(raw_hash);
+    int lock_index = get_lock_index(bucket_index);
 
-      std::shared_lock<std::shared_mutex> lock(table_mutexes[lock_index].mutex);
-      
-      // Recalculate bucket in case resize happened while waiting
-      // current_cap = capacity.load();
-      // bucket_index = get_bucket_index(raw_hash, current_cap);
-      const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
+    std::shared_lock<std::shared_mutex> lock(table_mutexes[lock_index].mutex);
+    
+    // Recalculate bucket in case resize happened while waiting
+    // current_cap = capacity.load();
+    // bucket_index = get_bucket_index(raw_hash, current_cap);
+    const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
-      for (const Ht_item<K, V>& item : bucket) {
-          if (item.key == key) {
-              return item.value;
-          }
+    for (const Ht_item<K, V>& item : bucket) {
+      if (item.key == key) {
+        return item.value;
       }
+    }
 
-      return std::nullopt;
+    return std::nullopt;
   }
 
   // Atomic insert of multiple keys into the hash table (2 or more)
   // returns number of new elements inserted in the table
   int multi_put(const std::vector<std::pair<K, V>>& kv_pairs) {
-      /* if ((float)(count.load() + kv_pairs.size()) / capacity.load() > load_factor) {
-          resize();
-      } */
+    /* if ((float)(count.load() + kv_pairs.size()) / capacity.load() > load_factor) {
+      resize();
+    } */
 
-      // Store required lock striped for this operation
-      std::vector<int> lock_indices;
-      lock_indices.reserve(kv_pairs.size());
-      // int current_cap = capacity.load();
+    // Store required lock striped for this operation
+    constexpr size_t MAX_MULTI_PUT_SIZE = 32;
+    int lock_indices[MAX_MULTI_PUT_SIZE];
+    size_t num_unique_locks = 0;
+    // int current_cap = capacity.load();
 
-      for (const std::pair<K, V>& kv : kv_pairs) {
-          uint64_t raw_hash = get_raw_hash(kv.first);
-          lock_indices.push_back(get_lock_index(get_bucket_index(raw_hash)));
+    size_t batch_size = std::min(kv_pairs.size(), MAX_MULTI_PUT_SIZE);
+    for (size_t i = 0; i < batch_size; ++i) {
+      uint64_t raw_hash = get_raw_hash(kv_pairs[i].first);
+      lock_indices[i] = get_lock_index(get_bucket_index(raw_hash));
+    }
+
+    // Sort lock indices in a global order (incrasing lock indices)
+    std::sort(lock_indices, lock_indices + batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      if (i == 0 || lock_indices[i] != lock_indices[i - 1]) {
+        lock_indices[num_unique_locks++] = lock_indices[i];
+      }
+    }
+
+    // Acquire all required locks
+    for (size_t i = 0; i < batch_size; ++i) {
+      table_mutexes[lock_indices[i]].mutex.lock();
+    }
+
+    // Batched put
+    int added = 0;
+    // current_cap = capacity.load();
+
+    for (size_t i = 0; i < batch_size; ++i) {
+      const auto &kv = kv_pairs[i];
+      uint64_t raw_hash = get_raw_hash(kv.first);
+      size_t bucket_index = get_bucket_index(raw_hash);
+      std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
+
+      bool found = false;
+      for (Ht_item<K, V> &item : bucket) {
+        if (item.key == kv.first) {
+          item.value = kv.second;
+          found = true;
+          break;
+        }
       }
 
-      // Acquire locks in a consistent global order (increasing index).
-      std::sort(lock_indices.begin(), lock_indices.end());
-      lock_indices.erase(std::unique(lock_indices.begin(), lock_indices.end()), lock_indices.end());
-
-      std::vector<std::unique_lock<std::shared_mutex>> locks;
-      locks.reserve(lock_indices.size());
-
-      for (int lock_idx : lock_indices) {
-          locks.emplace_back(table_mutexes[lock_idx].mutex);
+      if (!found) {
+        bucket.push_back({kv.first, kv.second});
+        added++;
       }
+    }
 
-      // Batched put
-      int added = 0;
-      // current_cap = capacity.load();
+    if (added > 0) {
+        count.fetch_add(added, std::memory_order_relaxed);
+    }
 
-      for (const std::pair<K, V>& kv : kv_pairs) {
-          uint64_t raw_hash = get_raw_hash(kv.first);
-          size_t bucket_index = get_bucket_index(raw_hash);
-          std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
+    // Release locks (Can be done in any order, but reverse is standard)
+    for (int i = num_unique_locks - 1; i >= 0; --i) {
+      table_mutexes[lock_indices[i]].mutex.unlock();
+    }
 
-          bool found = false;
-          for (Ht_item<K, V>& item : bucket) {
-              if (item.key == kv.first) {
-                  item.value = kv.second;
-                  found = true;
-                  break;
-              }
-          }
-
-          if (!found) {
-              bucket.push_back({kv.first, kv.second});
-              added++;
-          }
-      }
-
-      if (added > 0) {
-          count.fetch_add(added);
-      }
-
-      return added;
+    return added;
   }
-
   /* bool remove(const K& key) {
       uint64_t raw_hash = get_raw_hash(key);
       int current_cap = capacity.load();
