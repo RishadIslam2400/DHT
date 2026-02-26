@@ -194,6 +194,8 @@ int main(int argc, char** argv) {
     std::cout << "Average Client Latency:     " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
     std::cout << "Total Wall Time:            " << total_wall_time.count() << " s\n";
 
+    std::cout << std::endl;
+
     std::cout << "\n[TestApp] Benchmark complete. Entering grace period before shutdown...\n";
     // Allow slower nodes to finish routing their final packets to this node's storage layer
     std::this_thread::sleep_for(std::chrono::seconds(300));
