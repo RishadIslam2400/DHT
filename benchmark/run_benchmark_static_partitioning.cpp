@@ -27,7 +27,7 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
   std::vector<OpData> operations;
   operations.reserve(ops_count);
 
-  std::seed_seq seq{node_id, thread_id, 2400};
+  std::seed_seq seq{node_id, thread_id, 42};
   std::mt19937 rng(seq);
   std::uniform_int_distribution<int> key_dist(0, key_range - 1);
   std::uniform_int_distribution<int> val_dist(1, 10000);
