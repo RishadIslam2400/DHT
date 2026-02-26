@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\n[TestApp] Benchmark complete. Entering grace period before shutdown...\n";
     // Allow slower nodes to finish routing their final packets to this node's storage layer
-    std::this_thread::sleep_for(std::chrono::seconds(300));
+    std::this_thread::sleep_for(std::chrono::seconds(30));
 
     node.stop();
 

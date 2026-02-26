@@ -208,7 +208,7 @@ void StaticClusterDHTNode::wait_for_barrier() {
     }
 
     std::cout << "[Coordinator] Broadcasting GO signal...\n";
-    uint8_t go_signal = 1;
+    uint8_t go_signal = static_cast<uint8_t>(CommandType::CMD_GO);
     for (const auto& peer : barrier_sockets) {
       if (send(peer.second, &go_signal, 1, MSG_NOSIGNAL) != 1) {
         log_error("Failed to send go signal", errno);
@@ -217,6 +217,17 @@ void StaticClusterDHTNode::wait_for_barrier() {
 
     // Return sockets to the pool for the benchmark
     for (const auto& peer : barrier_sockets) {
+      uint8_t ack_buf;
+
+      // Wait to receive the 1-byte ACK before pooling the socket
+      if (!recv_n_bytes(peer.second, &ack_buf, 1)) {
+        log_error("Failed to receive GO ack", errno);
+        // If it fails, destroy the socket so it doesn't pollute the pool
+        connection_pool.return_connection(peer.first, peer.second, true);
+        continue; 
+      }
+
+      // Stream is perfectly clean. Return it to the pool.
       connection_pool.return_connection(peer.first, peer.second, false);
     }
 
