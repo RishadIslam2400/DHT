@@ -429,8 +429,7 @@ bool StaticClusterDHTNode::send_batch(const int target_id,
       // return healthy connection to connection pool
       connection_pool.return_connection(target_id, sock, false);
 
-      // Note: If you need to track stats for the batch, you can loop through 
-      // recv_buffer here and update stats.remote_puts_success/failed
+      stats.remote_puts_success += batch_requests.size();
       return true;
     }
 
@@ -439,6 +438,7 @@ bool StaticClusterDHTNode::send_batch(const int target_id,
   }
 
   // Failed all attempts
+  stats.remote_puts_failed += batch_requests.size();
   log_error("Batch request failed after retries", errno);
   return false;
 }

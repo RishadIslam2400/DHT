@@ -42,7 +42,8 @@ private:
 
   inline uint64_t hash_key(const std::string &key) const;              // returns raw hsah value of the key
   inline uint64_t hash_key(const uint32_t &key) const;                 // int overload
-  
+  inline const NodeConfig &get_target_node(const uint32_t &key) const; // get the node id for the key
+
   static bool recv_n_bytes(const int sock, void *buffer, const size_t n);                                                                                                                                    // receive exatcly n bytes from the sokcket descriptor
   bool perform_rpc_single_request(const int sock, CommandType cmd, const uint8_t *request, size_t request_size, uint8_t *response, size_t response_size);                                                    // Send a request and recieve a response
   bool send_single_request(const int target_id, const std::string &target_ip, const int target_port, CommandType cmd, const uint8_t *request, size_t request_size, uint8_t *response, size_t response_size); // send a request using connection pool
@@ -65,9 +66,6 @@ public:
   void warmup_network(int connections_per_peer); // Warm up the connection_pool
   void stop();         // stop the server
   void print_status(); // print the stats
-
-  inline const NodeConfig &get_target_node(const uint32_t &key) const; // get the node id for the key
-
 
   PutResult put(const uint32_t &key, const uint32_t &value); // Put a KV pair in DHT, returns PutResult (Inserted = 0, Updated = 1, Failed = 0)
   GetResponse get(const uint32_t &key);                      // Get a value from DHT, returns GetResult (GetResult.status: Found = 1 (GetResult.value), Not Found = 2, Error = 0)
