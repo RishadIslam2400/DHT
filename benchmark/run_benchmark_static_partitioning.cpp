@@ -81,22 +81,6 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
   total_ops_completed += n_ops;
 }
 
-void verify_hash_distribution(StaticClusterDHTNode& node, int max_key) {
-  std::vector<int> distribution(5, 0);
-
-  for (uint32_t key = 0; key < max_key; ++key) {
-    int target_id = node.get_target_node(key).id;
-    distribution[target_id]++;
-  }
-
-  std::cout << "Hash Distribution for Keys 0 to " << max_key - 1 << ":\n";
-  for (int i = 0; i < 5; ++i) {
-    double percentage = (static_cast<double>(distribution[i]) / max_key) * 100.0;
-    std::cout << "Node " << i << ": " << distribution[i] << " keys (" 
-              << std::fixed << std::setprecision(2) << percentage << "%)\n";
-  }
-}
-
 int main(int argc, char** argv) {
   // 1. Argument Parsing
   if (argc < 6) {
@@ -134,9 +118,8 @@ int main(int argc, char** argv) {
     size_t total_peers = cluster_map.size() - 1;
     size_t num_locks = total_peers * num_threads * 4;
     StaticClusterDHTNode node(cluster_map, self_config, key_range, num_locks);
-    verify_hash_distribution(node, key_range);
 
-    /* node.start(); 
+    node.start(); 
     node.warmup_network(num_threads);
     node.wait_for_barrier();
 
@@ -217,7 +200,7 @@ int main(int argc, char** argv) {
     // Allow slower nodes to finish routing their final packets to this node's storage layer
     std::this_thread::sleep_for(std::chrono::seconds(10));
 
-    node.stop(); */
+    node.stop();
 
   } catch (const std::exception& e) {
       std::cerr << "[Fatal Error] " << e.what() << std::endl;
