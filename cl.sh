@@ -200,7 +200,7 @@ function cl_benchmark() {
 
     KEY_RANGES=(10 100 1000 10000)
     THREAD_COUNTS=$(seq 1 8)
-    RUNS=1
+    RUNS=3
 
     echo "Starting Benchmark Suite: ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
 
