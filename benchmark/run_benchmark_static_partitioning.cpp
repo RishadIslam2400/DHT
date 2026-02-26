@@ -22,12 +22,13 @@ struct OpData {
 };
 
 void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count, 
-            int key_range, int seed, int put_prob = 20)
+            int key_range, int node_id, int put_prob)
 {
   std::vector<OpData> operations;
   operations.reserve(ops_count);
 
-  std::mt19937 rng(seed);
+  std::seed_seq seq{node_id, thread_id, 2400};
+  std::mt19937 rng(seq);
   std::uniform_int_distribution<int> key_dist(0, key_range - 1);
   std::uniform_int_distribution<int> val_dist(1, 10000);
   std::uniform_int_distribution<int> op_dist(1, 100);
@@ -132,8 +133,7 @@ int main(int argc, char** argv) {
 
     // spawn threads they will wait at the barrier
     for (int i = 0; i < num_threads; ++i) {
-        int seed = (node_id * 10000) + (i * 100) + std::time(nullptr);
-        workers.emplace_back(do_benchmark, &node, i, num_ops_per_thread, key_range, seed, 20);
+      workers.emplace_back(do_benchmark, &node, i, num_ops_per_thread, key_range, node_id, 20);
     }
 
     // wait for other threads to finish data generation
