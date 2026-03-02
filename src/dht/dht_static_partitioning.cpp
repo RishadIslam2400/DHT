@@ -9,7 +9,6 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <endian.h>
-#include "dht_static_partitioning.h"
 
 StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
                                            int hash_table_size, int num_locks)
