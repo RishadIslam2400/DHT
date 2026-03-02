@@ -10,7 +10,7 @@ set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithD
 
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -34,7 +34,7 @@ add_library(common_lib
 add_library(dht_lib 
     src/dht/dht_static_partitioning.cpp
     src/dht/node_properties.cpp
-    src/dht/dht_message_batcher.cpp
+    src/dht/dht_transaction_manager.cpp
     src/network/connection_pool.cpp
 )
 target_link_libraries(dht_lib PUBLIC common_lib Threads::Threads)
@@ -45,6 +45,10 @@ target_link_libraries(dht_lib PUBLIC common_lib Threads::Threads)
 # add_executable(test_striped_lock_hash_table tests/test_striped_lock_concurrent_hash_table.cpp)
 # target_link_libraries(test_striped_lock_hash_table PRIVATE Threads::Threads)
 # add_test(NAME ConcurrentHashTableTest COMMAND test_striped_lock_hash_table)
+
+add_executable(test_ts_hash_table tests/test_ts_hash_table.cpp)
+target_link_libraries(test_ts_hash_table PRIVATE Threads::Threads)
+add_test(NAME ConcurrentHashTableTest COMMAND test_ts_hash_table)
 
 # Connection pool test
 # add_executable(test_connection_pool tests/test_connection_pool.cpp)

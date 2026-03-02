@@ -1,5 +1,5 @@
 #include "dht/dht_static_partitioning.h"
-#include "dht/dht_message_batcher.h"
+#include "dht/dht_transaction_manager.h"
 
 #include <random>
 #include <iomanip>
@@ -15,14 +15,20 @@ std::atomic<bool> start_benchmark_flag{false};
 // To store exact finish times per thread
 std::vector<std::chrono::high_resolution_clock::time_point> thread_end_times;
 
+enum class OpType { 
+  GET, 
+  PUT, 
+  MULTI_PUT 
+};
+
 struct OpData {
-  int key;
-  int val;
-  bool is_put;
+  OpType type;
+  uint32_t key[3];
+  uint32_t val[3];
 };
 
 void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count, 
-            int key_range, int node_id, int put_prob)
+                  int key_range, int node_id)
 {
   std::vector<OpData> operations;
   operations.reserve(ops_count);
@@ -33,56 +39,76 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
   std::uniform_int_distribution<int> val_dist(1, 10000);
   std::uniform_int_distribution<int> op_dist(1, 100);
 
+  // Generate the 60/20/20 Workload Mix
   for (int i = 0; i < ops_count; ++i) {
     OpData op;
-    op.key = key_dist(rng);
-    op.is_put = (op_dist(rng) <= put_prob);
-    if (op.is_put) {
-        op.val = val_dist(rng);
+    int op_roll = op_dist(rng);
+
+    if (op_roll <= 60) {
+      op.type = OpType::GET;
+      op.key[0] = key_dist(rng);
+    } 
+    else if (op_roll <= 80) {
+      op.type = OpType::PUT;
+      op.key[0] = key_dist(rng);
+      op.val[0] = val_dist(rng);
+    } 
+    else {
+      op.type = OpType::MULTI_PUT;
+      // Generate exactly 3 keys for the 2PC transaction
+      for (int k = 0; k < 3; ++k) {
+        op.key[k] = key_dist(rng);
+        op.val[k] = val_dist(rng);
+      }
     }
     operations.push_back(op);
   }
 
   // Signal this thread is ready
   threads_ready_count++;
-
-  // Spin wait until main thread signals start
-  // We use yield to be nice to the scheduler, but for strict benchmarking 
-  // on dedicated cores, a tight spin is sometimes preferred.
   while(!start_benchmark_flag.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
+    #if defined(__x86_64__)
+      __builtin_ia32_pause();
+    #else
+      std::this_thread::yield();
+    #endif
   }
 
   uint64_t local_latency_ns = 0;
-
   auto* ops_ptr = operations.data();
   size_t n_ops = operations.size();
-
-  DHTMessageBatcher batcher(*node);
+  DHTTransactionManager batcher(*node);
 
   auto start = std::chrono::high_resolution_clock::now();
   for (size_t i = 0; i < n_ops; ++i) {
     const OpData &op = ops_ptr[i];
 
-    if (op.is_put) {
-      batcher.put(op.key, op.val);
-    } else {
-      GetResponse res = batcher.get(op.key);
+    if (op.type == OpType::GET) {
+      batcher.get_sync(op.key[0]);
+    } 
+    else if (op.type == OpType::PUT) {
+      batcher.put_sync(op.key[0], op.val[0]);
+    } 
+    else {
+      std::vector<std::pair<uint32_t, uint32_t>> batch(3);
+      batch[0] = {op.key[0], op.val[0]};
+      batch[1] = {op.key[1], op.val[1]};
+      batch[2] = {op.key[2], op.val[2]};
+      batcher.multi_put(batch);
     }
   }
-  batcher.flush_all();
+  // batcher.flush_all();
 
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-  local_latency_ns += duration;
-
-  thread_end_times[thread_id] = std::chrono::high_resolution_clock::now();
-  total_latency_ns += local_latency_ns;
-  total_ops_completed += n_ops;
+  
+  thread_end_times[thread_id] = end;
+  total_latency_ns.fetch_add(duration, std::memory_order_relaxed);
+  total_ops_completed.fetch_add(n_ops, std::memory_order_relaxed);
 }
 
 int main(int argc, char** argv) {
-  // 1. Argument Parsing
+  // Argument Parsing
   if (argc < 6) {
       std::cerr << "Usage: " << argv[0] << " <config_file> <node_id> <num_ops> <num_threads> <key_range>\n";
       return 1;
@@ -133,7 +159,7 @@ int main(int argc, char** argv) {
 
     // spawn threads they will wait at the barrier
     for (int i = 0; i < num_threads; ++i) {
-      workers.emplace_back(do_benchmark, &node, i, num_ops_per_thread, key_range, node_id, 20);
+      workers.emplace_back(do_benchmark, &node, i, num_ops_per_thread, key_range, node_id);
     }
 
     // wait for other threads to finish data generation
@@ -160,19 +186,20 @@ int main(int argc, char** argv) {
 
     std::chrono::duration<double> total_wall_time = latest_end- global_start;
 
-    // Only count operations physically executed in this node's storage layer
-    uint64_t storage_puts = node.stats.local_puts_inserted.load() + 
-                            node.stats.local_puts_updated.load();
-    
-    uint64_t storage_gets = node.stats.local_gets_found.load() + 
-                            node.stats.local_gets_not_found.load();
-
+    uint64_t storage_puts = node.stats.local_puts_inserted.load()
+                            + node.stats.local_puts_updated.load();
+    uint64_t storage_gets = node.stats.local_gets_found.load()
+                            + node.stats.local_gets_not_found.load();
     uint64_t total_storage_ops = storage_puts + storage_gets;
-    double goodput_ops_sec = total_storage_ops / total_wall_time.count();
+   
+    // Storage Goodput: Physical reads/writes handled by this node's RAM
+    double storage_iops = total_storage_ops / total_wall_time.count();
 
-    // Track the latency for this client
     uint64_t ops_generated = total_ops_completed.load();
     
+    // Client Throughput: Logical transactions pushed by this node's worker threads
+    double client_tps = ops_generated / total_wall_time.count();
+
     uint64_t failed_network_puts = node.stats.remote_puts_failed.load();
     uint64_t failed_network_gets = node.stats.remote_gets_failed.load();
     uint64_t total_network_failures = failed_network_puts + failed_network_gets;
@@ -183,21 +210,19 @@ int main(int argc, char** argv) {
     std::cout << "Benchmark RESULTS (Node " << node_id << ")\n";
     node.print_status(); 
 
-    std::cout << "\nPerformance Metrics\n";
-    std::cout << "\nSystem Goodput (Storage Layer)\n";
-    std::cout << "Total Operations Processed: " << total_storage_ops << "\n";
-    std::cout << "Node Throughput:            " << std::fixed << std::setprecision(2) << goodput_ops_sec << " ops/sec\n";
+    std::cout << "\nClient Experience\n";
+    std::cout << "Logical Transactions:   " << ops_generated << "\n";
+    std::cout << "Client Throughput:      " << std::fixed << std::setprecision(2) << client_tps << " tx/sec\n";
+    std::cout << "Average Latency:        " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
+    std::cout << "Network Drop/Failures:  " << total_network_failures << "\n";
+    std::cout << "Total Wall Time:        " << total_wall_time.count() << " s\n";
 
-    std::cout << "\nClient Experience (Network Layer)\n";
-    std::cout << "Operations Initiated:       " << ops_generated << "\n";
-    std::cout << "Network Drops/Failures:     " << total_network_failures << "\n";
-    std::cout << "Average Client Latency:     " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
-    std::cout << "Total Wall Time:            " << total_wall_time.count() << " s\n";
-
-    std::cout << std::endl;
+    std::cout << "\nNode Workload (Storage Backend)\n";
+    std::cout << "Physical KV Operations: " << total_storage_ops << "\n";
+    std::cout << "Storage IOPS:           " << std::fixed << std::setprecision(2) << storage_iops << " ops/sec\n";
+    std::cout << "2PC Transactions Aborted: " << node.stats.tx_aborted.load() << "\n";
 
     std::cout << "\n[TestApp] Benchmark complete. Entering grace period before shutdown...\n";
-    // Allow slower nodes to finish routing their final packets to this node's storage layer
     std::this_thread::sleep_for(std::chrono::seconds(10));
 
     node.stop();
