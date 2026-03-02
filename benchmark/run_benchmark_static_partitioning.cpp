@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
     std::cout << "2PC Transactions Aborted: " << node.stats.tx_aborted.load() << "\n";
 
     std::cout << "\n[TestApp] Benchmark complete. Entering grace period before shutdown...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::this_thread::sleep_for(std::chrono::seconds(30));
 
     node.stop();
 

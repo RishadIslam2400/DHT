@@ -522,6 +522,7 @@ PutResult StaticClusterDHTNode::put_remote(const uint32_t &key, const uint32_t &
                                      &response_byte, 1);
 
   if (success) {
+    stats.remote_puts_success.fetch_add(1, std::memory_order_relaxed);
     return static_cast<PutResult>(response_byte);
   }
 
