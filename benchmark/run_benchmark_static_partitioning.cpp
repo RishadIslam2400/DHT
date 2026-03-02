@@ -222,8 +222,11 @@ int main(int argc, char** argv) {
     std::cout << "Storage IOPS:           " << std::fixed << std::setprecision(2) << storage_iops << " ops/sec\n";
     std::cout << "2PC Transactions Aborted: " << node.stats.tx_aborted.load() << "\n";
 
-    std::cout << "\n[TestApp] Benchmark complete. Entering grace period before shutdown...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    std::cout << "\n[TestApp] Benchmark complete. Waiting for all peers at exit barrier...\n";
+    
+    node.wait_for_exit_barrier();
+    
+    std::cout << "[TestApp] Exit barrier cleared. Safe to shutdown.\n";
 
     node.stop();
 

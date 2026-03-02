@@ -17,7 +17,8 @@ enum class CommandType : uint8_t {
   CMD_QUIT = 6,       // Shutdown signal
   CMD_TX_PREPARE = 7, // 2PC Phase 1: Lock keys and validate LWW timestamps
   CMD_TX_COMMIT = 8,  // 2PC Phase 2: Apply writes to storage and unlock
-  CMD_TX_ABORT = 9    // 2PC Phase 2: Discard staging area writes and unlock
+  CMD_TX_ABORT = 9,   // 2PC Phase 2: Discard staging area writes and unlock
+  CMD_EXIT_BARRIER = 10
 };
 
 // Payload for single or batched put operations over the network.

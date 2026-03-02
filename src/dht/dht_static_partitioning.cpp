@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <endian.h>
+#include "dht_static_partitioning.h"
 
 StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
                                            int hash_table_size, int num_locks)
@@ -232,6 +233,42 @@ void StaticClusterDHTNode::wait_for_barrier() {
     }
   }
 }
+
+void StaticClusterDHTNode::wait_for_exit_barrier() {
+  size_t expected_peers = cluster_map.size() - 1;
+  if (expected_peers == 0) return;
+
+  // 1. Broadcast "I am finished" to all other nodes
+  for (const NodeConfig& peer : cluster_map) {
+    if (peer.id == self_config.id) continue;
+
+    uint8_t ack = 0;
+    bool success = false;
+    
+    // Retry loop: If the network is saturated with 2PC traffic, 
+    // the barrier ping might drop. Keep trying until acknowledged.
+    while (!success) {
+      success = send_single_request(peer.id, peer.ip, peer.port, 
+                                    CommandType::CMD_EXIT_BARRIER, 
+                                    nullptr, 0, 
+                                    &ack, 1);
+      
+      if (!success) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  }
+
+  // 2. Wait until all peers have broadcasted "I am finished" to us
+  while (exit_barrier_count.load(std::memory_order_acquire) < expected_peers) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  // 3. Brief hardware propagation delay
+  // Ensures the final TCP ACKs traverse the physical NIC hardware 
+  // before the application forcefully closes the sockets.
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+} 
 
 // -------------------------------Utility Functions------------------------------------
 // Receive exactly 'n' bytes. Returns true on success, false on failure/close.
@@ -1127,6 +1164,18 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         }
 
         benchmark_ready.store(true, std::memory_order_release);
+        break;
+      }
+
+      case CommandType::CMD_EXIT_BARRIER: {
+        // Increment the count of peers that have finished their workload
+        exit_barrier_count.fetch_add(1, std::memory_order_release);
+        
+        uint8_t ack = 1;
+        if (send(client_socket, &ack, 1, MSG_NOSIGNAL) != 1) [[unlikely]] {
+          log_error("Failed to send exit barrier ack", errno);
+          goto cleanup;
+        }
         break;
       }
     }

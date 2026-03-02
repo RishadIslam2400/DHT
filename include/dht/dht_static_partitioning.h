@@ -124,6 +124,9 @@ public:
 
   void wait_for_barrier();
 
+  std::atomic<size_t> exit_barrier_count{0};
+  void wait_for_exit_barrier();
+
   inline uint64_t increment_logical_clock() {
       return logical_clock.fetch_add(1, std::memory_order_relaxed);
   }
