@@ -13,19 +13,21 @@ chmod 700 $SCREENDIR
 
 # Print usage information
 usage() {
-	cat <<EOF
+    cat <<EOF
 
 cl.sh — tool for building & running binary executables on the Sunlab
 Usage: ./cl.sh <command> [arguments]
 Commands:
     install-deps            Setup SSH keys and verify remote hosts.
     init-config             Generate the cluster configuration file (config.txt).
-    run <exe> <ops> <threads> <range>
-                            Run the compiled binary.
-                            <exe> : Name of the target in build/
-                            <ops> : Number of operations
-                            <threads>: Number of threads
-                            <range> : Key range
+    run <exe> <ops> <threads> <range> <rep_deg>
+                            Run the compiled binary interactively.
+                            <exe>     : Name of the target in build/
+                            <ops>     : Number of operations
+                            <threads> : Number of threads
+                            <range>   : Key range
+                            <rep_deg> : Replication Degree (e.g., 1 or 2)
+    benchmark <exe> <ops>   Run the automated benchmark suite across all configurations.
     connect                 Open a screen session connected to all nodes.
     reset <proc_name>       Kill a specific process name on all nodes.
     reset-all               Kill all user processes on all nodes.
@@ -91,90 +93,88 @@ function cl_install_deps() {
 }
 
 # SEND and RUN a binary on the remote MACHINES
-# $1: Exe, $2: Ops, $3: Threads, $4: Key Range
+# $1: Exe, $2: Ops, $3: Threads, $4: Key Range, $5: Replication Degree
 function cl_run() {
-	# check if file exists
-	EXE_NAME=$(basename "$1")
-	NUM_OPS=$2
+    EXE_NAME=$(basename "$1")
+    NUM_OPS=$2
     NUM_THREADS=$3
     KEY_RANGE=$4
-	
-	if [[ -z "$1" || -z "$2" || -z "$3" || -z "$4" ]]; then
-        echo "Usage: ./cl.sh run <exe> <ops> <threads> <range>"
+    REP_DEG=$5
+    
+    if [[ -z "$1" || -z "$2" || -z "$3" || -z "$4" || -z "$5" ]]; then
+        echo "Usage: ./cl.sh run <exe> <ops> <threads> <range> <rep_deg>"
         exit 1
     fi
 
-	generate_cluster_config
+    generate_cluster_config
 
-	echo "Uploading config.txt to all nodes (Destination: ${REMOTE_BUILD_DIR})..."
+    echo "Uploading config.txt to all nodes (Destination: ${REMOTE_BUILD_DIR})..."
     for m in ${MACHINES[*]}; do
         scp "config.txt" "${USER}@${m}.${DOMAIN}:${REMOTE_BUILD_DIR}/" &
     done
     wait
-	rm -rf logs
-	mkdir logs
-	# Set up a screen script for running the program on all MACHINES
-	tmp_screen="$(mktemp)" || exit 1
-	make_screen "$tmp_screen"
+    rm -rf logs
+    mkdir logs
+    # Set up a screen script for running the program on all MACHINES
+    tmp_screen="$(mktemp)" || exit 1
+    make_screen "$tmp_screen"
 
-	echo "Launching $EXE_NAME from $REMOTE_BUILD_DIR on remote nodes..."
+    echo "Launching $EXE_NAME from $REMOTE_BUILD_DIR on remote nodes (RF=$REP_DEG)..."
 
-	for i in "${!MACHINES[@]}"; do
-		host="${MACHINES[$i]}"
-		#ARGS="your args" # modify it
-		
-		# COMMAND: cd to build dir -> run binary -> pass config location
-        # Note: We assume config.txt is in HOME (~/), so we pass "../config.txt" or "~/config.txt"
-		CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${NUM_THREADS} ${KEY_RANGE}"
-		echo "Node $i ($host): $CMD"
-		cat >>"$tmp_screen" <<EOF
+    for i in "${!MACHINES[@]}"; do
+        host="${MACHINES[$i]}"
+        
+        # COMMAND: cd to build dir -> run binary -> pass config and arguments
+        CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${NUM_THREADS} ${KEY_RANGE} ${REP_DEG}"
+        echo "Node $i ($host): $CMD"
+        cat >>"$tmp_screen" <<EOF
 screen -t node${i} ssh ${USER}@${host}.${DOMAIN} ${CMD}; bash
 logfile logs/log_${i}.txt
 log on
 EOF
-	done
+    done
 
-	screen -c "$tmp_screen"
-	rm "$tmp_screen"
+    screen -c "$tmp_screen"
+    rm "$tmp_screen"
 }
 
 # Connect to remote nodes (e.g., for debugging)
 function cl_connect() {
-	last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
+    last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
 
-	# Set up a screen script for connecting
-	tmp_screen="$(mktemp)" || exit 1
-	make_screen $tmp_screen
-	for i in $(seq 0 ${last_valid_index}); do
-		echo "screen -t node${i} ssh ${USER}@${MACHINES[$i]}.${DOMAIN}" >>${tmp_screen}
-	done
-	screen -c $tmp_screen
-	rm $tmp_screen
+    # Set up a screen script for connecting
+    tmp_screen="$(mktemp)" || exit 1
+    make_screen $tmp_screen
+    for i in $(seq 0 ${last_valid_index}); do
+        echo "screen -t node${i} ssh ${USER}@${MACHINES[$i]}.${DOMAIN}" >>${tmp_screen}
+    done
+    screen -c $tmp_screen
+    rm $tmp_screen
 }
 
 function do_all {
-	for i in "${!MACHINES[@]}"; do
-		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "$1" &
-	done
-	wait
+    for i in "${!MACHINES[@]}"; do
+        ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "$1" &
+    done
+    wait
 }
 
 function reset-all() {
-	last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
-	for i in $(seq 0 ${last_valid_index}); do
-		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "killall -9 -u $USER" &
-	done
-	wait
-	echo "Nodes have been reset."
+    last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
+    for i in $(seq 0 ${last_valid_index}); do
+        ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "killall -9 -u $USER" &
+    done
+    wait
+    echo "Nodes have been reset."
 }
 
 function reset() {
-	last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
-	for i in $(seq 0 ${last_valid_index}); do
-		ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "pkill $1 || true" &
-	done
-	wait
-	echo "Nodes have been reset."
+    last_valid_index=$((${#MACHINES[@]} - 1)) # The 0-indexed number of nodes
+    for i in $(seq 0 ${last_valid_index}); do
+        ssh ${USER}@${MACHINES[$i]}.${DOMAIN} "pkill $1 || true" &
+    done
+    wait
+    echo "Nodes have been reset."
 }
 
 function cl_benchmark() {
@@ -198,36 +198,40 @@ function cl_benchmark() {
     rm -rf "$LOG_DIR"
     mkdir -p "$LOG_DIR"
 
+    REPLICATION_DEGREES=(1 2)
     KEY_RANGES=(10 100 1000 10000)
     THREAD_COUNTS=$(seq 1 8)
     RUNS=3
 
-    echo "Starting Benchmark Suite: ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
+    echo "Starting Benchmark Suite: ${#REPLICATION_DEGREES[@]} Repl Factors, ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
 
     # 3. The Loop
-    for range in "${KEY_RANGES[@]}"; do
-        for threads in $THREAD_COUNTS; do
-            echo "--- Configuration: Range=${range}, Threads=${threads} ---"
+    for rep_deg in "${REPLICATION_DEGREES[@]}"; do
+        for range in "${KEY_RANGES[@]}"; do
+            for threads in $THREAD_COUNTS; do
+                echo "--- Configuration: RepDeg=${rep_deg}, Range=${range}, Threads=${threads} ---"
 
-            for run in $(seq 1 $RUNS); do
-                echo "BENCHMARK: Range=$range, Run=$run/$RUNS"
-                
-                pids=""
-                for i in "${!MACHINES[@]}"; do
-                    host="${MACHINES[$i]}"
+                for run in $(seq 1 $RUNS); do
+                    echo "BENCHMARK: RF=$rep_deg, Range=$range, Run=$run/$RUNS"
                     
-                    CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${threads} ${range}"
+                    pids=""
+                    for i in "${!MACHINES[@]}"; do
+                        host="${MACHINES[$i]}"
+                        
+                        CMD="cd ${REMOTE_BUILD_DIR} && ./${EXE_NAME} config.txt ${i} ${NUM_OPS} ${threads} ${range} ${rep_deg}"
+                        
+                        # Added Rep Factor to the log file name
+                        LOG_FILE="${LOG_DIR}/Rep${rep_deg}_R${range}_T${threads}_Run${run}_Node${i}.log"
+                        
+                        ssh "${USER}@${host}.${DOMAIN}" "$CMD" > "$LOG_FILE" 2>&1 &
+                        
+                        pids="$pids $!"
+                    done
                     
-                    LOG_FILE="${LOG_DIR}/R${range}_T${threads}_Run${run}_Node${i}.log"
-                    
-                    ssh "${USER}@${host}.${DOMAIN}" "$CMD" > "$LOG_FILE" 2>&1 &
-                    
-                    pids="$pids $!"
+                    # Wait for all nodes to finish this specific run before continuing
+                    wait $pids || true
+                    echo "Run $run completed. Logs saved to $LOG_DIR"
                 done
-                
-                # Wait for all nodes to finish this specific run before continuing
-                wait $pids || true
-                echo "Run $run completed. Logs saved to $LOG_DIR"
             done
         done
     done
@@ -239,8 +243,10 @@ function cl_benchmark() {
 # Get the important stuff out of the command-line args
 cmd=$1   # The requested command
 count=$# # The number of command-line args
+
 # Navigate the the project root directory
 cd $(git rev-parse --show-toplevel)
+
 # Load the config right away
 for file in config/*.conf; do
 	if [ -f $file ]; then
@@ -249,21 +255,21 @@ for file in config/*.conf; do
 done
 
 if [[ "$cmd" == "install-deps" && "$count" -eq 1 ]]; then
-	cl_install_deps
+    cl_install_deps
 elif [[ "$cmd" == "init-config" ]]; then
     generate_cluster_config
-elif [[ "$cmd" == "run" && "$count" -eq 5 ]]; then
-	cl_run "$2" "$3" "$4" "$5"
+elif [[ "$cmd" == "run" && "$count" -eq 6 ]]; then
+    cl_run "$2" "$3" "$4" "$5" "$6"
 elif [[ "$cmd" == "benchmark" && "$count" -eq 3 ]]; then
     cl_benchmark "$2" "$3"
 elif [[ "$cmd" == "connect" && "$count" -eq 1 ]]; then
-	cl_connect
+    cl_connect
 elif [[ "$cmd" == "reset" && "$count" -eq 2 ]]; then
-	reset $2
+    reset $2
 elif [[ "$cmd" == "reset-all" && "$count" -eq 1 ]]; then
-	reset-all
+    reset-all
 elif [[ "$cmd" == "do-all" && "$count" -eq 2 ]]; then
-	do_all "$2"
+    do_all "$2"
 else
-	usage
+    usage
 fi

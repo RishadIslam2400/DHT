@@ -55,10 +55,10 @@ add_test(NAME ConcurrentHashTableTest COMMAND test_ts_hash_table)
 # target_link_libraries(test_connection_pool PRIVATE dht_lib)
 # add_test(NAME ConnectionPoolTest COMMAND test_connection_pool)
 
-# DHT Static Partitioning Test
-# add_executable(test_dht_static_partitioning tests/test_dht_static_partitioning.cpp)
-# target_link_libraries(test_dht_static_partitioning PRIVATE dht_lib)
-# add_test(NAME DHTTest COMMAND test_dht_static_partitioning)
+# RHT Static Partitioning Test
+# add_executable(test_rht tests/test_rht.cpp)
+# target_link_libraries(test_rht PRIVATE dht_lib)
+# add_test(NAME RHTTest COMMAND test_rht)
 
 # DHT Static Partitioning Benchmark
 add_executable(run_benchmark_static_partitioning benchmark/run_benchmark_static_partitioning.cpp)

@@ -28,6 +28,6 @@ public:
   int get_connection(const int target_id, const std::string &target_ip, const int target_port);
   void return_connection(const int target_id, const int sock, const bool destroy);
 
-  // Optional: Call this before the benchmark starts to establish initial TCP handshakes
+  // Call this before the benchmark starts to establish initial TCP handshakes
   void pre_warm(const int target_id, const std::string &target_ip, const int target_port, const int count);
 };

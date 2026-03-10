@@ -108,9 +108,8 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
 }
 
 int main(int argc, char** argv) {
-  // Argument Parsing
-  if (argc < 6) {
-      std::cerr << "Usage: " << argv[0] << " <config_file> <node_id> <num_ops> <num_threads> <key_range>\n";
+  if (argc < 7) {
+      std::cerr << "Usage: " << argv[0] << " <config_file> <node_id> <num_ops> <num_threads> <key_range> <replication_degree>\n";
       return 1;
   }
 
@@ -119,6 +118,8 @@ int main(int argc, char** argv) {
   int total_num_ops = std::stoi(argv[3]);
   int num_threads = std::stoi(argv[4]);
   int key_range = std::stoi(argv[5]);
+  int replication_degree = std::stoi(argv[6]);
+
   int num_ops_per_thread = total_num_ops / num_threads;
 
   thread_end_times.resize(num_threads);
@@ -143,7 +144,7 @@ int main(int argc, char** argv) {
 
     size_t total_peers = cluster_map.size() - 1;
     size_t num_locks = total_peers * num_threads * 4;
-    StaticClusterDHTNode node(cluster_map, self_config, key_range, num_locks);
+    StaticClusterDHTNode node(cluster_map, self_config, key_range, num_locks, replication_degree);
 
     node.start(); 
     node.warmup_network(num_threads);
@@ -162,7 +163,7 @@ int main(int argc, char** argv) {
       workers.emplace_back(do_benchmark, &node, i, num_ops_per_thread, key_range, node_id);
     }
 
-    // wait for other threads to finish data generation
+    // Wait for all local threads to finish memory allocation and PRNG generation
     while(threads_ready_count.load() < num_threads) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -186,41 +187,66 @@ int main(int argc, char** argv) {
 
     std::chrono::duration<double> total_wall_time = latest_end- global_start;
 
+    // Aggregate Storage & Server-Side Metrics
     uint64_t storage_puts = node.stats.local_puts_inserted.load()
-                            + node.stats.local_puts_updated.load();
+                          + node.stats.local_puts_updated.load()
+                          + node.stats.local_puts_dropped.load();
     uint64_t storage_gets = node.stats.local_gets_found.load()
-                            + node.stats.local_gets_not_found.load();
+                          + node.stats.local_gets_not_found.load();
     uint64_t total_storage_ops = storage_puts + storage_gets;
+
+    // Goodput Volume: Only count successful operations
+    uint64_t successful_storage_ops = node.stats.local_puts_inserted.load()
+                                    + node.stats.local_puts_updated.load()
+                                    + node.stats.local_gets_found.load()
+                                    + node.stats.local_gets_not_found.load();
    
-    // Storage Goodput: Physical reads/writes handled by this node's RAM
+    // Cohort Contention: How often this server had to reject a remote 2PC request
+    uint64_t cohort_rejections = node.stats.tx_prepare_rejected_locked.load() 
+                               + node.stats.tx_prepare_rejected_obsolete.load();
+
     double storage_iops = total_storage_ops / total_wall_time.count();
+    double server_goodput_iops = successful_storage_ops / total_wall_time.count();
 
+    // Aggregate Client Metrics
     uint64_t ops_generated = total_ops_completed.load();
-    
-    // Client Throughput: Logical transactions pushed by this node's worker threads
     double client_tps = ops_generated / total_wall_time.count();
-
-    uint64_t failed_network_puts = node.stats.remote_puts_failed.load();
-    uint64_t failed_network_gets = node.stats.remote_gets_failed.load();
-    uint64_t total_network_failures = failed_network_puts + failed_network_gets;
 
     double avg_latency_ns = static_cast<double>(total_latency_ns.load()) / ops_generated;
     double avg_latency_us = avg_latency_ns / 1000.0;
 
+    // Aggregate Network & Coordinator Metrics
+    uint64_t failed_network_puts = node.stats.remote_puts_failed.load();
+    uint64_t failed_network_gets = node.stats.remote_gets_failed.load();
+    uint64_t total_network_failures = failed_network_puts + failed_network_gets;
+
+    uint64_t tx_aborted = node.stats.local_tx_aborted.load();
+    uint64_t tx_committed = node.stats.local_tx_committed.load();
+    uint64_t total_tx = tx_aborted + tx_committed;
+
+    double abort_rate = (total_tx > 0) ? (static_cast<double>(tx_aborted) / total_tx) * 100.0 : 0.0;
+
     std::cout << "Benchmark RESULTS (Node " << node_id << ")\n";
     node.print_status(); 
 
-    std::cout << "\nClient Experience\n";
-    std::cout << "Logical Transactions:   " << ops_generated << "\n";
-    std::cout << "Client Throughput:      " << std::fixed << std::setprecision(2) << client_tps << " tx/sec\n";
-    std::cout << "Average Latency:        " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
-    std::cout << "Network Drop/Failures:  " << total_network_failures << "\n";
-    std::cout << "Total Wall Time:        " << total_wall_time.count() << " s\n";
+    std::cout << "Client Experience (Logical Layer)\n";
+    std::cout << "  Total Transactions:       " << ops_generated << "\n";
+    std::cout << "  Client Throughput:        " << std::fixed << std::setprecision(2) << client_tps << " tx/sec\n";
+    std::cout << "  Average Latency:          " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
+    std::cout << "  Total Wall Time:          " << std::fixed << std::setprecision(4) << total_wall_time.count() << " s\n";
 
-    std::cout << "\nNode Workload (Storage Backend)\n";
-    std::cout << "Physical KV Operations: " << total_storage_ops << "\n";
-    std::cout << "Storage IOPS:           " << std::fixed << std::setprecision(2) << storage_iops << " ops/sec\n";
-    std::cout << "2PC Transactions Aborted: " << node.stats.tx_aborted.load() << "\n";
+    std::cout << "Server & Storage Health (Physical Layer)\n\n";
+    std::cout << "  Physical KV Operations:   " << total_storage_ops << " ops (Total)\n";
+    std::cout << "  Successful KV Operations: " << successful_storage_ops << " ops (Goodput Volume)\n";
+    std::cout << "  Storage IOPS:             " << std::fixed << std::setprecision(2) << storage_iops << " ops/sec\n";
+    std::cout << "  Server Goodput:           " << std::fixed << std::setprecision(2) << server_goodput_iops << " ops/sec\n";
+    std::cout << "  Cohort Lock Rejections:   " << cohort_rejections << " (Contention)\n";
+
+    std::cout << "Distributed Coordinator (2PC Network)\n";
+    std::cout << "  2PC TX Commited:          " << tx_committed << "\n";
+    std::cout << "  2PC TX Aborted:           " << tx_aborted << "\n";
+    std::cout << "  2PC Retry/Abort Rate:     " << std::fixed << std::setprecision(2) << abort_rate << "%\n";
+    std::cout << "  Total Network Drops:      " << total_network_failures << " packets\n";
 
     std::cout << "\n[TestApp] Benchmark complete. Waiting for all peers at exit barrier...\n";
     

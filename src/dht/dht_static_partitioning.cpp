@@ -11,15 +11,17 @@
 #include <endian.h>
 
 StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
-                                           int hash_table_size, int num_locks)
+                                           int hash_table_size, int num_locks, int rep_deg)
   : cluster_map{std::move(map)}, 
     self_config{std::move(self)},
     storage{hash_table_size, num_locks},
+    replication_degree{rep_deg},
     server_fd{-1},
     running{false},
     connection_pool(cluster_map.size()),
     benchmark_ready{false}
 {
+  // Pre-allocate to prevent heap fragmentation during runtime
   logically_locked_keys.reserve(1024);
   staging_area.reserve(128);
 
@@ -33,9 +35,11 @@ StaticClusterDHTNode::~StaticClusterDHTNode() {
 
 void StaticClusterDHTNode::start() {
   running = true;
+  // Detach the listener loop to its own thread to asynchronously accept incoming TCP connections
   listener_thread = std::thread(&StaticClusterDHTNode::listen_loop, this);
 }
 
+// Establishes persistent TCP connections to avoid 3-way handshake latency during the benchmark
 void StaticClusterDHTNode::warmup_network(int connections_per_peer) {
   std::cout << "[Node " << self_config.id << "] Pre-warming " 
             << connections_per_peer << " connections to each peer..." << std::endl;
@@ -50,6 +54,7 @@ void StaticClusterDHTNode::warmup_network(int connections_per_peer) {
   std::cout << "[Node " << self_config.id << "] Network pre-warm complete." << std::endl;
 }
 
+// Graceful shutdown sequence. Safely terminates active sockets to prevent data corruption.
 void StaticClusterDHTNode::stop() {
   if (!running)
     return;
@@ -96,10 +101,11 @@ void StaticClusterDHTNode::stop() {
 }
 
 void StaticClusterDHTNode::print_status() {    
+  // Aggregate base metrics
   uint32_t total_local_puts = stats.local_puts_inserted + stats.local_puts_updated
                               + stats.local_puts_dropped;
   uint32_t total_local_gets = stats.local_gets_found + stats.local_gets_not_found;
-  uint32_t total_tx_coordinated = stats.tx_committed + stats.tx_aborted;
+  uint32_t total_tx_coordinated = stats.local_tx_committed + stats.local_tx_aborted;
 
   std::cout << "\nNode " << self_config.id << " Statistics\n";
   std::cout << "[Local Hash Table Metrics]\n";
@@ -124,15 +130,16 @@ void StaticClusterDHTNode::print_status() {
   std::cout << "[Distributed Transactions (2PC)]\n";
   std::cout << "  Coordinator:\n";
   std::cout << "    - TX Initiated:           " << total_tx_coordinated << "\n";
-  std::cout << "    - TX Committed:           " << stats.tx_committed << "\n";
-  std::cout << "    - TX Aborted:             " << stats.tx_aborted << "\n\n";
+  std::cout << "    - TX Committed:           " << stats.local_tx_committed << "\n";
+  std::cout << "    - TX Aborted:             " << stats.local_tx_aborted << "\n\n";
   
   std::cout << "  Cohort:\n";
   std::cout << "    - Rejected (Locked):      " << stats.tx_prepare_rejected_locked << "\n";
   std::cout << "    - Rejected (Obsolete):    " << stats.tx_prepare_rejected_obsolete << "\n";
 }
 
-// distributed barrier: Node 0 acts as the coordinator
+// Guarantees all nodes start the benchmark simultaneously. 
+// Node 0 acts as the Central Coordinator.
 void StaticClusterDHTNode::wait_for_barrier() {
   if (self_config.id == 0) {
     std::cout << "[Coordinator] Barrier initiated. Waiting for pings from peers...\n";
@@ -149,10 +156,9 @@ void StaticClusterDHTNode::wait_for_barrier() {
     if (!running)
       return;
 
-    // Broadcast GO signal to all workers
+    // Broadcast CMD_GO signal to all workers via pre-warmed sockets
     std::cout << "[Coordinator] All peers checked in. Fetching sockets...\n";
 
-    // use the pre-warmed up connection pool
     std::vector<std::pair<int, int>> barrier_sockets;
     barrier_sockets.reserve(total_peers);
 
@@ -177,29 +183,24 @@ void StaticClusterDHTNode::wait_for_barrier() {
       }
     }
 
-    // Return sockets to the pool for the benchmark
+    // Wait to receive the 1-byte ACK to clear the TCP buffer before pooling the socket
     for (const auto& peer : barrier_sockets) {
       uint8_t ack_buf;
 
-      // Wait to receive the 1-byte ACK before pooling the socket
-      // otherwise it will remain in the buffer and corrupt the opearation requests
       if (!recv_n_bytes(peer.second, &ack_buf, 1)) {
         log_error("Failed to receive GO ack", errno);
-        // If it fails, destroy the socket so it doesn't pollute the pool
         connection_pool.return_connection(peer.first, peer.second, true);
         continue;
       }
 
-      // Stream is perfectly clean. Return it to the pool.
       connection_pool.return_connection(peer.first, peer.second, false);
     }
 
-    // other nodes set benchmark_ready to true after recieving GO message
     benchmark_ready.store(true, std::memory_order_release);
   } else {
+    // Worker Node Logic: Ping Node 0 and wait for GO
     std::cout << "[Worker] Reached barrier. Notifying Coordinator...\n";
 
-    // Send the node id to coordinator for checkin
     const NodeConfig& coord = cluster_map[0];
     uint8_t response = 0;
 
@@ -209,7 +210,6 @@ void StaticClusterDHTNode::wait_for_barrier() {
 
     bool success = false;
     while (running) {
-      // Use the pre-warmed pool for the check-in which is already in the connection pool
       success = send_single_request(coord.id, coord.ip, coord.port,
                                     CommandType::CMD_BARRIER, buf, 4, &response, 1);
 
@@ -222,7 +222,7 @@ void StaticClusterDHTNode::wait_for_barrier() {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    // wait until GO command and set benchmark_ready 
+    // Spin-wait until CMD_GO is received and processed by handle_client 
     while (running && !benchmark_ready.load(std::memory_order_acquire)) {
       #if defined(__x86_64__)
         __builtin_ia32_pause();
@@ -233,19 +233,21 @@ void StaticClusterDHTNode::wait_for_barrier() {
   }
 }
 
+// All-to-all broadcast barrier to ensure no node shuts down its listener socket until 
+// all peers have finished their workload
 void StaticClusterDHTNode::wait_for_exit_barrier() {
   size_t expected_peers = cluster_map.size() - 1;
   if (expected_peers == 0) return;
 
-  // 1. Broadcast "I am finished" to all other nodes
+  // Broadcast finshed signal to all other nodes
   for (const NodeConfig& peer : cluster_map) {
-    if (peer.id == self_config.id) continue;
+    if (peer.id == self_config.id)
+      continue;
 
     uint8_t ack = 0;
     bool success = false;
     
-    // Retry loop: If the network is saturated with 2PC traffic, 
-    // the barrier ping might drop. Keep trying until acknowledged.
+    // Retry loop: Network might be saturated with straggler 2PC traffic.
     while (!success) {
       success = send_single_request(peer.id, peer.ip, peer.port, 
                                     CommandType::CMD_EXIT_BARRIER, 
@@ -258,33 +260,34 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
     }
   }
 
-  // 2. Wait until all peers have broadcasted "I am finished" to us
+  // Wait until all peers have broadcasted finished flag to current node
   while (exit_barrier_count.load(std::memory_order_acquire) < expected_peers) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
-  // 3. Brief hardware propagation delay
-  // Ensures the final TCP ACKs traverse the physical NIC hardware 
-  // before the application forcefully closes the sockets.
+  // Hardware propagation delay to ensure final TCP ACKs clear the NIC
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
 } 
 
 // -------------------------------Utility Functions------------------------------------
-// Receive exactly 'n' bytes. Returns true on success, false on failure/close.
+
 bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size_t n) {
   size_t total_read = 0;
   char *buf_ptr = static_cast<char *>(buffer);
 
   while (total_read < n) {
+    // MSG_WAITALL forces the kernel to block until exactly 'n' bytes are read.
     ssize_t received = recv(sock, buf_ptr + total_read, n - total_read, MSG_WAITALL);
 
     if (received < 0) {
-      if (errno == EINTR) continue; // if the read call was interrupted then retry
+      if (errno == EINTR)
+        continue; // Retry if interrupted by system signal
+
       return false;
     }
 
     if (received == 0) {
-      errno = ECONNRESET; // EOF detected
+      // EOF detected
       return false;
     }
 
@@ -293,14 +296,14 @@ bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size
   return true;
 }
 
-// Sending request and receiving response for a single request
+// Low-level Scatter-Gather I/O execution
 bool StaticClusterDHTNode::perform_rpc_single_request(const int sock, CommandType cmd,
                                                       const uint8_t* request,
                                                       size_t request_size,
                                                       uint8_t* response,
                                                       size_t response_size)
 {
-  // Use Scatter/Gather IO to send cmd and request in a single tcp transmission
+  // Writev completely eliminates memcpy overhead by passing two pointers directly to the kernel
   struct iovec iov[2];
 
   uint8_t cmd_byte = static_cast<uint8_t>(cmd);
@@ -313,24 +316,21 @@ bool StaticClusterDHTNode::perform_rpc_single_request(const int sock, CommandTyp
     iov[1].iov_len = request_size;
     iov_count = 2;
   }
-
-  size_t total_send_size = 1 + request_size;
   
-  if (writev(sock, iov, iov_count) != static_cast<ssize_t>(total_send_size)) {
+  if (writev(sock, iov, iov_count) != static_cast<ssize_t>(1 + request_size)) {
     log_error("Error sending single request via writev", errno);
     return false;
   }
 
-  // Process the response
+  // Process the fixed-length response header
   if (!recv_n_bytes(sock, response, response_size)) {
-    log_error("Error receiving response status", errno);
+    log_error("Error receiving response from single request", errno);
     return false;
   }
 
   // Handle variable length response for CMD_GET
+  // If GET was successful, trigger a second read to fetch the 4-byte value
   if (cmd == CommandType::CMD_GET && response[0] == static_cast<uint8_t>(GetStatus::Found)) {
-    // The server found the key and is appending 4 bytes for the value.
-    // We read them directly into the response buffer offset by 1.
     if (!recv_n_bytes(sock, response + response_size, 4)) {
       log_error("Error recieving the value", errno);
       return false;
@@ -340,7 +340,8 @@ bool StaticClusterDHTNode::perform_rpc_single_request(const int sock, CommandTyp
   return true;
 }
 
-// Send request using connection pool, retry once if fails
+// Wraps the RPC in a bounded retry loop, managing socket checkout and return 
+// against the Thread-Safe Connection Pool
 bool StaticClusterDHTNode::send_single_request(const int target_id,
                                                const std::string& target_ip,
                                                const int target_port,
@@ -366,8 +367,8 @@ bool StaticClusterDHTNode::send_single_request(const int target_id,
     return true;
   }
 
-  // Failed: The socket might have been stale (server closed it).
-  // Destroy the old socket and try one more time with a fresh connection.
+  // The socket might have gone stale.
+  // Destroy the broken socket and try exactly one more time with a freshly dialed TCP connection.
   connection_pool.return_connection(target_id, sock, true);
 
   sock = connection_pool.get_connection(target_id, target_ip, target_port);
@@ -403,7 +404,7 @@ bool StaticClusterDHTNode::send_batch(const int target_id,
   uint8_t send_buffer[MAX_SEND_BYTES];
   uint8_t recv_buffer[BATCH_SIZE];
 
-  // Serialize all the requests into the send buffer
+  // Serialize the request count into the header
   uint16_t batch_size = static_cast<uint16_t>(batch_requests.size());
   uint16_t batch_size_net = htons(batch_size);
 
@@ -461,14 +462,15 @@ bool StaticClusterDHTNode::send_batch(const int target_id,
   return false;
 }
 
+// Evaluates incoming network timestamps and fast-forwards the local Lamport clock
 void StaticClusterDHTNode::synchronize_clock(const uint64_t incoming_ts) {
   // Read the current clock value
   uint64_t current_clock = logical_clock.load(std::memory_order_relaxed);
 
   // Loop until current clock is >= incoming_ts, or we successfully update it
   while (current_clock < incoming_ts) {
-    // compare_exchange_weak updates logical_clock to incoming_ts IF it still equals current_clock.
-    // If it fails (another thread updated it), current_clock is automatically refreshed with the new value.
+    // If logical_clock still equals current_clock, it updates to incoming_ts.
+    // If it fails (another thread updated it), current_clock is automatically refreshed.
     if (logical_clock.compare_exchange_weak(current_clock, incoming_ts, std::memory_order_relaxed)) {
       break;
     }
@@ -480,7 +482,8 @@ PutResult StaticClusterDHTNode::put_local(const uint32_t& key, const uint32_t& v
   constexpr int MAX_RETRIES = 1000;
   uint16_t attempt = 0;
 
-  // 2PC logical clock check with bounded spin-wait
+  // Bounded Spin-Wait: Pauses physical insertion if the key is currently 
+  // logically locked by an active 2PC Phase 1 transaction.
   while (true) {
     bool is_locked = false;
     {
@@ -496,19 +499,19 @@ PutResult StaticClusterDHTNode::put_local(const uint32_t& key, const uint32_t& v
 
     attempt++;
     if (attempt >= MAX_RETRIES) {
-      return PutResult::Failed;
+      return PutResult::Failed; // Prevent permanent thread starvation
     }
 
     if (attempt < 100) {
       #if defined(__x86_64__)
-        __builtin_ia32_pause();
+        __builtin_ia32_pause(); // Hint to CPU to optimize pipeline during spin
       #endif
     } else {
-      std::this_thread::sleep_for(std::chrono::microseconds(5));
+      std::this_thread::sleep_for(std::chrono::microseconds(5)); // Yield to OS scheduler
     }
   }
 
-  // Storage wrrite operation
+  // Physical insertion utilizing the strict Last-Write-Wins (LWW) conflict resolver
   PutResult result = storage.put(key, value, timestamp);
 
   // Update stats
@@ -613,11 +616,12 @@ GetResponse StaticClusterDHTNode::get_remote(const uint32_t &key, const uint64_t
   }
 }
 
+/// Two-Phase Commit (2PC) Server State Machine
+// PHASE 1: Optimistic Concurrency Control (OCC) Validation
 bool StaticClusterDHTNode::local_tx_prepare(const uint64_t &tx_timestamp,
                                             const std::vector<std::pair<uint32_t, uint32_t>> &batch)
 {
-  // Optimistic locking of keys
-  // Acquire spinlock to claim the logical locks on the keys
+  // Acquire global spinlock to check for overlapping active transactions
   {
     std::lock_guard<Spinlock> lock(tx_spinlock);
 
@@ -625,28 +629,27 @@ bool StaticClusterDHTNode::local_tx_prepare(const uint64_t &tx_timestamp,
     for (const auto& kv : batch) {
       if (std::ranges::find(logically_locked_keys, kv.first) != logically_locked_keys.end()) {
         stats.tx_prepare_rejected_locked.fetch_add(1, std::memory_order_relaxed);
-        return false; // Key is already locked by another active transaction
+        return false; // Key is locked
       }
     }
 
-    // Claim the locks optimistically so other threads cannot touch these keys.
+    // Optimistically claim the locks so other threads/network requests cannot touch these keys
     for (const auto& kv : batch) {
       logically_locked_keys.push_back(kv.first);
     }
   } // release spinlock
 
-  // LWW timestamp validation check
-  // Verify that no newer data has been committed to the hash table
+  // Validate LWW Timestamps against the physical storage layer
   bool is_obsolete = false;
   for (const auto& kv : batch) {
-    uint64_t current_ts = storage.get_timestamp(kv.first); // Acquire exclusive access to shared mutex
+    uint64_t current_ts = storage.get_timestamp(kv.first);
     if (tx_timestamp <= current_ts) {
       is_obsolete = true;
       break;
     }
   }
 
-  // Validation failed, rollback the logically locked key
+  // Rollback logical locks if LWW validation failed
   if (is_obsolete) {
     std::lock_guard<Spinlock> lock(tx_spinlock);
     for (const auto& kv : batch) {
@@ -663,19 +666,20 @@ bool StaticClusterDHTNode::local_tx_prepare(const uint64_t &tx_timestamp,
     return false;
   }
 
-  // Validation passed, stage the transaction, acquire spinlock
+  // Validation passed. Move payload to Staging Area awaiting Phase 2 Commit.
   {
     std::lock_guard<Spinlock> lock(tx_spinlock);
     staging_area.push_back({tx_timestamp, batch});
-  } // release spinlock
+  }
 
   return true;
 }
 
+// PHASE 2 (Success): Extract from staging area and apply to physical storage
 void StaticClusterDHTNode::local_tx_commit(const uint64_t &tx_timestamp) {
   std::vector<std::pair<uint32_t, uint32_t>> batch_to_commit;
   
-  // Acquire the global spinlock to steal the key from staging area
+  // Acquire the spinlock to steal the transaction from the staging area
   {
     std::lock_guard<Spinlock> lock(tx_spinlock);
 
@@ -694,18 +698,19 @@ void StaticClusterDHTNode::local_tx_commit(const uint64_t &tx_timestamp) {
   } // Release spinlock
 
   if (batch_to_commit.empty()) [[unlikely]] {
-    return;
+    return; // Safety guard against duplicate commits
   }
 
-  // Insert in local storage
-  // Current keys are safe as they are still in logically_locked_keys.
+  // Insert into local storage
+  // This operation is guaranteed safe from data races because the keys 
+  // are still held inside logically_locked_keys
   if (batch_to_commit.size() == 1) {
     storage.put(batch_to_commit[0].first, batch_to_commit[0].second, tx_timestamp);
   } else {
     storage.multi_put(batch_to_commit, tx_timestamp);
   }
 
-  // relase the keys from logically_locked_keys
+  // Release the logical locks to allow new transactions
   {
     std::lock_guard<Spinlock> lock(tx_spinlock);
     
@@ -716,11 +721,12 @@ void StaticClusterDHTNode::local_tx_commit(const uint64_t &tx_timestamp) {
         logically_locked_keys.pop_back();
       }
     }
-  } // release spinlock
+  }
 
-  stats.tx_committed.fetch_add(1, std::memory_order_relaxed);
+  stats.local_tx_committed.fetch_add(1, std::memory_order_relaxed);
 }
 
+// PHASE 2 (Failure): Coordinator ordered rollback
 void StaticClusterDHTNode::local_tx_abort(const uint64_t &tx_timestamp) {
   std::vector<std::pair<uint32_t, uint32_t>> discarded_batch;
 
@@ -754,16 +760,18 @@ void StaticClusterDHTNode::local_tx_abort(const uint64_t &tx_timestamp) {
     }
   } // release spinlock
 
-  stats.tx_aborted.fetch_add(1, std::memory_order_relaxed);
+  stats.local_tx_aborted.fetch_add(1, std::memory_order_relaxed);
   // discarded_batch vector goes out of scope
 }
 
+/// 2PC Coordinator Network Execution
+// Sends PREPARE message and awaits Cohort's vote
 bool StaticClusterDHTNode::send_tx_prepare(const int target_id,
                                            const uint64_t tx_timestamp,
                                            const std::vector<std::pair<uint32_t, uint32_t>> &batch)
 {
   // Locate target node details
-  if (target_id < 0 || target_id >= cluster_map.size()) [[unlikely]] {
+  if (target_id < 0 || target_id >= static_cast<int>(cluster_map.size())) [[unlikely]] {
     return false;
   }
   const NodeConfig &target = cluster_map[target_id];
@@ -773,18 +781,18 @@ bool StaticClusterDHTNode::send_tx_prepare(const int target_id,
     if (batch_size > BATCH_SIZE) return false;
   #endif
 
-  // Allocate buffers for request
+  // Calculate strict buffer sizes to avoid memory overallocation
   constexpr size_t MAX_BUF_SIZE = 10 + (BATCH_SIZE * 8);
   size_t actual_request_size = 10 + (batch_size * 8);
   uint8_t request_buf[MAX_BUF_SIZE];
 
-  // Header: timestamp + batch size
+  // Serialize Header: [Timestamp:8][BatchSize:2]
   uint64_t net_ts = htobe64(tx_timestamp);
   uint16_t net_batch_size = htons(batch_size);
   std::memcpy(request_buf, &net_ts, 8);
   std::memcpy(request_buf + 8, &net_batch_size, 2);
 
-  // kv pairs
+  // Serialize Payload: [Key:4][Value:4]
   size_t offset = 10;
   for (const auto& kv : batch) {
     uint32_t net_k = htonl(kv.first);
@@ -805,8 +813,9 @@ bool StaticClusterDHTNode::send_tx_prepare(const int target_id,
   return success && (response == 1);
 }
 
+// Send Phase 2 COMMIT message
 bool StaticClusterDHTNode::send_tx_commit(const int target_id, const uint64_t tx_timestamp) {
-  if (target_id < 0 || target_id >= cluster_map.size()) [[unlikely]] {
+  if (target_id < 0 || target_id >= static_cast<int>(cluster_map.size())) [[unlikely]] {
     return false;
   }
   const NodeConfig &target = cluster_map[target_id];
@@ -814,6 +823,7 @@ bool StaticClusterDHTNode::send_tx_commit(const int target_id, const uint64_t tx
   uint64_t net_ts = htobe64(tx_timestamp);
   uint8_t response = 0;
 
+  // Direct memory reinterpretation completely bypasses memcpy
   bool success = send_single_request(target.id, target.ip, target.port,
                                      CommandType::CMD_TX_COMMIT,
                                      reinterpret_cast<uint8_t *>(&net_ts), 8,
@@ -828,8 +838,9 @@ bool StaticClusterDHTNode::send_tx_commit(const int target_id, const uint64_t tx
   return success;
 }
 
+// Send Phase 2 ABORT message
 bool StaticClusterDHTNode::send_tx_abort(const int target_id, const uint64_t tx_timestamp) {
-  if (target_id < 0 || target_id >= cluster_map.size()) [[unlikely]] {
+  if (target_id < 0 || target_id >= static_cast<int>(cluster_map.size())) [[unlikely]] {
     return false;
   }
   const NodeConfig &target = cluster_map[target_id];
@@ -850,11 +861,10 @@ bool StaticClusterDHTNode::send_tx_abort(const int target_id, const uint64_t tx_
     return success;
 }
 
-// Handle accepted client launched on a new thread
-// Thread per connection model: once a thread connects to a client it will recieve
-// messages from the client until the client closes the connection or until timeout
+// Thread-per-connection model. Persistently reads from a specific client socket until EOF
 void StaticClusterDHTNode::handle_client(int client_socket) {
-  // Set a 60-second receive timeout
+  // Set a 60-second receive timeout to prevent dead or partitioned connections 
+  // from permanently consuming the server's thread pool.
   struct timeval tv;
   tv.tv_sec = 60;
   tv.tv_usec = 0;
@@ -862,19 +872,20 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
   uint8_t cmd_buf;
 
-  // Pre-allocate dynamic buffers
+  // Pre-allocate dynamic buffers to prevent heap fragmentation during rapid parsing
   std::vector<uint8_t> tx_batch_buf;
   tx_batch_buf.reserve(BATCH_SIZE * 8);
 
   std::vector<std::pair<uint32_t, uint32_t>> tx_batch;
   tx_batch.reserve(BATCH_SIZE);
 
-  // Persistent loop to continue reading until the node stops running
   while (running) {
     // Both the batch request and single request has a command type in the first byte
     if (!recv_n_bytes(client_socket, &cmd_buf, 1)) [[unlikely]] {
       #ifndef NDEBUG
-        log_error("Could not read command byte", errno);
+        if (running && errno != 0 && errno != ECONNRESET) {
+          log_error("Could not read command byte", errno);
+        }
       #endif
       break;
     }
@@ -889,7 +900,6 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
     switch(cmd) {
       case CommandType::CMD_PUT: {
-        // Single strictly consistent put (put_sync)
         // Read 16 Bytes: [Key:4][Value:4][Timestamp:8]
         uint8_t buf[16];
         if (!recv_n_bytes(client_socket, buf, 16)) [[unlikely]] {
@@ -907,10 +917,8 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         uint32_t value = ntohl(net_value);
         uint64_t timestamp = be64toh(net_ts);
 
-        // Sync the Lamport clock
         synchronize_clock(timestamp);
 
-        // Process locally
         PutResult result = put_local(key, value, timestamp);
 
         // Send 1 byte response
@@ -923,7 +931,6 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       }
 
       case CommandType::CMD_GET: {
-        // Single read operation
         // Read 12 bytes: [Key:4][Read_Timestamp:8]
         uint8_t buf[12];
         if (!recv_n_bytes(client_socket, buf, 12)) [[unlikely]] {
@@ -939,7 +946,8 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         uint32_t key = ntohl(net_key);
         uint64_t read_ts = be64toh(net_ts);
 
-        synchronize_clock(read_ts); // Sync clock on reads for causal consistency
+        // Sync clock to ensure Causal Consistency for the read
+        synchronize_clock(read_ts);
 
         std::optional<uint32_t> res = get_local(key);
         GetResponse result = res.has_value() ? GetResponse::success(res.value())

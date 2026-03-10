@@ -27,14 +27,19 @@ struct NodeStats {
   alignas(64) std::atomic<uint32_t> remote_gets_success{0};
   alignas(64) std::atomic<uint32_t> remote_gets_failed{0};
 
-  // 2PC Metrics  
-  // Coordinator (Client-side) metrics
-  alignas(64) std::atomic<uint32_t> tx_committed{0};
-  alignas(64) std::atomic<uint32_t> tx_aborted{0};
-
-  // Cohort (Server-side) metrics for PREPARE phase analysis
+  // Cohort (Server-side) 2PC Metrics
+  // Prepare phase
   alignas(64) std::atomic<uint32_t> tx_prepare_rejected_locked{0};   // Failed due to active 2PC lock contention
   alignas(64) std::atomic<uint32_t> tx_prepare_rejected_obsolete{0}; // Failed due to LWW timestamp ordering
+  // Commit/Abort phase
+  alignas(64) std::atomic<uint32_t> local_tx_committed{0};
+  alignas(64) std::atomic<uint32_t> local_tx_aborted{0};
+
+  // Coordinator 2PC metrics
+  alignas(64) std::atomic<uint32_t> coordinator_tx_committed{0};
+  alignas(64) std::atomic<uint32_t> coordinator_tx_retries{0};
+  alignas(64) std::atomic<uint32_t> coordinator_tx_failed{0};
+  alignas(64) std::atomic<uint32_t> coordinator_phase2_retries{0};
 };
 
 std::vector<NodeConfig> load_config(const std::string &filename);
