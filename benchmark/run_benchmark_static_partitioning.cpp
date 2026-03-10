@@ -168,7 +168,9 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::cout << "[TestApp] All threads ready. Starting measurement.\n";
+    #ifndef NDEBUG
+      std::cout << "[TestApp] All threads ready. Starting measurement.\n";
+    #endif
 
     auto global_start = std::chrono::high_resolution_clock::now();
     start_benchmark_flag.store(true, std::memory_order_release);
@@ -233,20 +235,20 @@ int main(int argc, char** argv) {
     std::cout << "  Total Transactions:       " << ops_generated << "\n";
     std::cout << "  Client Throughput:        " << std::fixed << std::setprecision(2) << client_tps << " tx/sec\n";
     std::cout << "  Average Latency:          " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
-    std::cout << "  Total Wall Time:          " << std::fixed << std::setprecision(4) << total_wall_time.count() << " s\n";
+    std::cout << "  Total Wall Time:          " << std::fixed << std::setprecision(4) << total_wall_time.count() << " s\n\n";
 
-    std::cout << "Server & Storage Health (Physical Layer)\n\n";
+    std::cout << "Server & Storage Health (Physical Layer)\n";
     std::cout << "  Physical KV Operations:   " << total_storage_ops << " ops (Total)\n";
     std::cout << "  Successful KV Operations: " << successful_storage_ops << " ops (Goodput Volume)\n";
     std::cout << "  Storage IOPS:             " << std::fixed << std::setprecision(2) << storage_iops << " ops/sec\n";
     std::cout << "  Server Goodput:           " << std::fixed << std::setprecision(2) << server_goodput_iops << " ops/sec\n";
-    std::cout << "  Cohort Lock Rejections:   " << cohort_rejections << " (Contention)\n";
+    std::cout << "  Cohort Lock Rejections:   " << cohort_rejections << " (Contention)\n\n";
 
     std::cout << "Distributed Coordinator (2PC Network)\n";
     std::cout << "  2PC TX Commited:          " << tx_committed << "\n";
     std::cout << "  2PC TX Aborted:           " << tx_aborted << "\n";
     std::cout << "  2PC Retry/Abort Rate:     " << std::fixed << std::setprecision(2) << abort_rate << "%\n";
-    std::cout << "  Total Network Drops:      " << total_network_failures << " packets\n";
+    std::cout << "  Total Network Drops:      " << total_network_failures << " packets\n\n";
 
     std::cout << "\n[TestApp] Benchmark complete. Waiting for all peers at exit barrier...\n";
     
