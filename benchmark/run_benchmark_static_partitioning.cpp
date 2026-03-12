@@ -250,11 +250,11 @@ int main(int argc, char** argv) {
     std::cout << "  2PC Retry/Abort Rate:     " << std::fixed << std::setprecision(2) << abort_rate << "%\n";
     std::cout << "  Total Network Drops:      " << total_network_failures << " packets\n\n";
 
-    std::cout << "\n[TestApp] Benchmark complete. Waiting for all peers at exit barrier...\n";
+    std::cout << "\n[TestApp] Benchmark complete. Waiting for all peers at exit barrier..." << std::endl;
     
     node.wait_for_exit_barrier();
     
-    std::cout << "[TestApp] Exit barrier cleared. Safe to shutdown.\n";
+    std::cout << "[TestApp] Exit barrier cleared. Safe to shutdown." << std::endl;
 
     node.stop();
 

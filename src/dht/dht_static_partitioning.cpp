@@ -237,7 +237,8 @@ void StaticClusterDHTNode::wait_for_barrier() {
 // all peers have finished their workload
 void StaticClusterDHTNode::wait_for_exit_barrier() {
   size_t expected_peers = cluster_map.size() - 1;
-  if (expected_peers == 0) return;
+  if (expected_peers == 0)
+    return;
 
   // Broadcast finshed signal to all other nodes
   for (const NodeConfig& peer : cluster_map) {
@@ -246,16 +247,21 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
 
     uint8_t ack = 0;
     bool success = false;
+    int retries = 0;
     
-    // Retry loop: Network might be saturated with straggler 2PC traffic.
-    while (!success) {
+    // Bounded Retry Loop: 
+    // If the network drops a packet due to 2PC saturation, we retry.
+    // But if the peer has ALREADY finished and exited, the connection will 
+    // be refused. We cap retries at 5 to prevent infinite exit deadlocks.
+    while (!success && retries < 5) {
       success = send_single_request(peer.id, peer.ip, peer.port, 
                                     CommandType::CMD_EXIT_BARRIER, 
                                     nullptr, 0, 
                                     &ack, 1);
       
       if (!success) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        retries++;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
     }
   }
