@@ -175,7 +175,7 @@ void StaticClusterDHTNode::wait_for_barrier() {
       }
     }
 
-    std::cout << "[Coordinator] Broadcasting GO signal...\n";
+    std::cout << "[Coordinator] Broadcasting GO signal..." << std::endl;
     uint8_t go_signal = static_cast<uint8_t>(CommandType::CMD_GO);
     for (const auto& peer : barrier_sockets) {
       if (send(peer.second, &go_signal, 1, MSG_NOSIGNAL) != 1) {
@@ -214,7 +214,7 @@ void StaticClusterDHTNode::wait_for_barrier() {
                                     CommandType::CMD_BARRIER, buf, 4, &response, 1);
 
       if (success && response == 1) {
-        std::cout << "[Worker] Coordinator got checkin notification. Waiting for GO...\n";
+        std::cout << "[Worker] Coordinator got checkin notification. Waiting for GO..." << std::endl;
         break;
       }
 
