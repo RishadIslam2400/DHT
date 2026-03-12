@@ -808,15 +808,23 @@ bool StaticClusterDHTNode::send_tx_prepare(const int target_id,
     offset += 8;
   }
 
-  // Transmit and wait for Cohort's 1-byte vote
-  uint8_t response = 0;
+  // Transmit and wait for Cohort's 9-byte response: [Vote:1][CurrentClock:8]
+  uint8_t response_buf[9];
   bool success = send_single_request(target.id, target.ip, target.port, 
                                      CommandType::CMD_TX_PREPARE, 
                                      request_buf, actual_request_size, 
-                                     &response, 1);
+                                     response_buf, 9);
 
-  // The transaction is only prepared if the network succeeded and the server voted yes
-  return success && (response == 1);
+  if (success) {
+    // Extract the remote server's clock and instantly catch up
+    uint64_t remote_clock;
+    std::memcpy(&remote_clock, response_buf + 1, 8);
+    synchronize_clock(be64toh(remote_clock));
+    
+    return response_buf[0] == 1; // Return true only if the server voted YES
+  }
+
+  return false;
 }
 
 // Send Phase 2 COMMIT message
@@ -1074,9 +1082,16 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
         // Execute Phase 1 Validation
         bool prepared = local_tx_prepare(tx_timestamp, tx_batch);
-        uint8_t response = prepared ? 1 : 0;
 
-        if (send(client_socket, &response, 1, MSG_NOSIGNAL) != 1) [[unlikely]] {
+        // Pack 9-byte response: [Vote:1][CurrentClock:8]
+        uint8_t response_buf[9];
+        response_buf[0] = prepared ? 1 : 0;
+
+        // Read our current clock and append it to the response
+        uint64_t current_clock = htobe64(logical_clock.load(std::memory_order_relaxed));
+        std::memcpy(response_buf + 1, &current_clock, 8);
+
+        if (send(client_socket, response_buf, 1, MSG_NOSIGNAL) != 9) [[unlikely]] {
           log_error("Failed to vote for 2PC Phase 1", errno);
           goto cleanup;
         }
