@@ -198,9 +198,9 @@ function cl_benchmark() {
     rm -rf "$LOG_DIR"
     mkdir -p "$LOG_DIR"
 
-    REPLICATION_DEGREES=(1 2)
+    REPLICATION_DEGREES=(1 2 3)
     KEY_RANGES=(10 100 1000 10000)
-    THREAD_COUNTS=$(seq 1 8)
+    THREAD_COUNTS=(1 2 4 8 16 32)
     RUNS=3
 
     echo "Starting Benchmark Suite: ${#REPLICATION_DEGREES[@]} Repl Factors, ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
@@ -208,7 +208,7 @@ function cl_benchmark() {
     # 3. The Loop
     for rep_deg in "${REPLICATION_DEGREES[@]}"; do
         for range in "${KEY_RANGES[@]}"; do
-            for threads in $THREAD_COUNTS; do
+            for threads in "${THREAD_COUNTS[@]}"; do
                 echo "--- Configuration: RepDeg=${rep_deg}, Range=${range}, Threads=${threads} ---"
 
                 for run in $(seq 1 $RUNS); do

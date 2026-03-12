@@ -207,6 +207,20 @@ GetResponse DHTTransactionManager::get_sync(const uint32_t& key) {
 bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint32_t>> &kv_pairs) {
   int attempt = 0;
 
+  // Deduplicate keys within the batch (Last-Write-Wins)
+  // If the benchmark PRNG accidentally generates the same key twice in a tight range (Range=10),
+  // we collapse it to save network bandwidth and prevent self-collision locks.
+  /* std::vector<std::pair<uint32_t, uint32_t>> deduped_pairs;
+  for (const auto& kv : kv_pairs) {
+    auto it = std::find_if(deduped_pairs.begin(), deduped_pairs.end(), 
+                           [&](const auto& p) { return p.first == kv.first; });
+    if (it != deduped_pairs.end()) {
+      it->second = kv.second; // Update to the newest value
+    } else {
+      deduped_pairs.push_back(kv);
+    }
+  } */
+
   // Pre-allocate tracking vectors
   size_t num_nodes = dht_node.cluster_map.size();
   std::vector<std::vector<std::pair<uint32_t, uint32_t>>> cohorts(num_nodes);
@@ -231,14 +245,11 @@ bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint
     }
   }
 
-  // Sort IDs so the local node is evaluated first. If the local lock acquisition fails,
-  // the transaction aborts instantly
+  // We sort cohort IDs in strict mathematical ascending order (e.g., Node 0 -> Node 1).
+  // Initially we used "local_id" first. Enforcing a strict global sequence prevents symmetric 
+  // livelocks where Node A holds A and requests B, while Node B holds B and requests A.
   int local_id = dht_node.self_config.id;
-  std::sort(active_cohort_ids.begin(), active_cohort_ids.end(), [local_id](int a, int b) {
-    if (a == local_id) return true;
-    if (b == local_id) return false;
-    return a < b; 
-  });
+  std::sort(active_cohort_ids.begin(), active_cohort_ids.end());
 
   // Optimistic concurrency control retry loop
   while (attempt < MAX_RETRIES) {

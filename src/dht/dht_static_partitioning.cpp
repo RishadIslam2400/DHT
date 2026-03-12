@@ -866,7 +866,7 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
   // Set a 60-second receive timeout to prevent dead or partitioned connections 
   // from permanently consuming the server's thread pool.
   struct timeval tv;
-  tv.tv_sec = 60;
+  tv.tv_sec = 120;
   tv.tv_usec = 0;
   setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
 

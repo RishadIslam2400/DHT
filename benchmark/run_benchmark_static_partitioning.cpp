@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
     std::cout << "  Cohort Lock Rejections:   " << cohort_rejections << " (Contention)\n\n";
 
     std::cout << "Distributed Coordinator (2PC Network)\n";
-    std::cout << "  2PC TX Commited:          " << tx_committed << "\n";
+    std::cout << "  2PC TX Committed:          " << tx_committed << "\n";
     std::cout << "  2PC TX Aborted:           " << tx_aborted << "\n";
     std::cout << "  2PC Retry/Abort Rate:     " << std::fixed << std::setprecision(2) << abort_rate << "%\n";
     std::cout << "  Total Network Drops:      " << total_network_failures << " packets\n\n";
