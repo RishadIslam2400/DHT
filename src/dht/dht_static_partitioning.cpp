@@ -1091,7 +1091,7 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         uint64_t current_clock = htobe64(logical_clock.load(std::memory_order_relaxed));
         std::memcpy(response_buf + 1, &current_clock, 8);
 
-        if (send(client_socket, response_buf, 1, MSG_NOSIGNAL) != 9) [[unlikely]] {
+        if (send(client_socket, response_buf, 9, MSG_NOSIGNAL) != 9) [[unlikely]] {
           log_error("Failed to vote for 2PC Phase 1", errno);
           goto cleanup;
         }
