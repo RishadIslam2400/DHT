@@ -245,11 +245,14 @@ bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint
     }
   }
 
-  // We sort cohort IDs in strict mathematical ascending order (e.g., Node 0 -> Node 1).
-  // Initially we used "local_id" first. Enforcing a strict global sequence prevents symmetric 
-  // livelocks where Node A holds A and requests B, while Node B holds B and requests A.
+  // Sort IDs so the local node is evaluated first. If the local lock acquisition fails,
+  // the transaction aborts instantly
   int local_id = dht_node.self_config.id;
-  std::sort(active_cohort_ids.begin(), active_cohort_ids.end());
+  std::sort(active_cohort_ids.begin(), active_cohort_ids.end(), [local_id](int a, int b) {
+    if (a == local_id) return true;
+    if (b == local_id) return false;
+    return a < b; 
+  });
 
   // Optimistic concurrency control retry loop
   while (attempt < MAX_RETRIES) {
@@ -326,8 +329,14 @@ bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint
 
       dht_node.stats.coordinator_tx_retries.fetch_add(1, std::memory_order_relaxed);
       
-      int backoff_us = 10 * (1 << std::min(attempt, 10));
-      std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+      // Apply Exponential Backoff WITH JITTER to prevent Dueling Coordinator livelocks
+      static thread_local std::mt19937 generator(std::random_device{}());
+      int base_backoff = 10 * (1 << std::min(attempt, 10));
+      
+      // Randomize the sleep time between 50% and 100% of the backoff
+      std::uniform_int_distribution<int> jitter(base_backoff / 2, base_backoff);
+      std::this_thread::sleep_for(std::chrono::microseconds(jitter(generator)));
+
       continue; 
     } else {
       // All nodes voted yes, Execute the atomic write.
