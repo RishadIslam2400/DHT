@@ -299,7 +299,7 @@ bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint
       // safely releases its locks, preventing permanent distributed deadlocks.
       int delivery_attempts = 0;
       bool delivered = false;
-      while (delivery_attempts < 5 && !delivered) {
+      while (delivery_attempts < 100 && !delivered) {
         if (is_commit) {
           delivered = dht_node.send_tx_commit(target_id, tx_timestamp);
         } else {
@@ -309,7 +309,8 @@ bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint
         if (!delivered) {
           delivery_attempts++;
           dht_node.stats.coordinator_phase2_retries.fetch_add(1, std::memory_order_relaxed);
-          std::this_thread::sleep_for(std::chrono::milliseconds(2 * delivery_attempts));
+          int sleep_ms = std::min(10 * delivery_attempts, 500);
+          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
         }
       }
       if (!delivered) {
