@@ -245,40 +245,56 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
   uint8_t req_buf[4];
   std::memcpy(req_buf, &net_id, 4);
 
-  // Broadcast finshed signal to all other nodes
+  // Track the peers we still need to successfully notify
+  std::set<int> unacknowledged_peers;
   for (const NodeConfig& peer : cluster_map) {
-    if (peer.id == self_config.id)
-      continue;
-
-    uint8_t ack = 0;
-    bool success = false;
-    int retries = 0;
-    
-    // Bounded Retry Loop: 
-    // If the network drops a packet due to 2PC saturation, we retry.
-    // But if the peer has ALREADY finished and exited, the connection will 
-    // be refused. We cap retries at 5 to prevent infinite exit deadlocks.
-    while (!success && retries < 5) {
-      // Send 4 bytes of payload
-      success = send_single_request(peer.id, peer.ip, peer.port, 
-                                    CommandType::CMD_EXIT_BARRIER, 
-                                    req_buf, 4, 
-                                    &ack, 1);
-      
-      if (!success) {
-        retries++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      }
+    if (peer.id != self_config.id) {
+      unacknowledged_peers.insert(peer.id);
     }
   }
 
-  // Wait until the unique set of exited peers reaches the required size
+  // Active Gossiping Loop: Continuously notify missing peers while waiting
   while (true) {
+    // Attempt to deliver the exit signal to anyone who hasn't ACKed us yet
+    for (auto it = unacknowledged_peers.begin(); it != unacknowledged_peers.end(); ) {
+      int peer_id = *it;
+      
+      // Locate the peer's configuration
+      const NodeConfig* target = nullptr;
+      for (const auto& p : cluster_map) {
+        if (p.id == peer_id) {
+          target = &p;
+          break;
+        }
+      }
+
+      uint8_t ack = 0;
+      bool success = send_single_request(target->id, target->ip, target->port, 
+                                         CommandType::CMD_EXIT_BARRIER, 
+                                         req_buf, 4, 
+                                         &ack, 1);
+      
+      if (success) {
+        // TCP delivery confirmed. Remove from the pending list.
+        it = unacknowledged_peers.erase(it); 
+      } else {
+        // Delivery failed (peer backlog is full). Leave in the set and retry on the next tick.
+        ++it; 
+      }
+    }
+
+    // Check the bidirectional exit condition
     {
       std::lock_guard<std::mutex> lock(exit_mtx);
-      if (exited_peers.size() >= expected_peers) 
+      // A node can only safely terminate its listener socket if:
+      // A) Every peer has informed us they are done running benchmarks.
+      // B) We have successfully informed every peer that we are done.
+      if (exited_peers.size() >= expected_peers && unacknowledged_peers.empty()) {
         break;
+      }
     }
+
+    // Throttle the gossip to prevent network flooding while waiting
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
