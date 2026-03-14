@@ -39,10 +39,10 @@ int ConnectionPool::create_new_connection(const std::string &target_ip, const in
     return -1;
   }
 
-  struct timeval timeout;
-  timeout.tv_sec = 120; timeout.tv_usec = 0;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  // struct timeval timeout;
+  // timeout.tv_sec = 120; timeout.tv_usec = 0;
+  // setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  // setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
   int opt = 1;
   setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
