@@ -40,7 +40,7 @@ int ConnectionPool::create_new_connection(const std::string &target_ip, const in
   }
 
   struct timeval timeout;
-  timeout.tv_sec = 2; timeout.tv_usec = 0;
+  timeout.tv_sec = 120; timeout.tv_usec = 0;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
