@@ -240,6 +240,11 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
   if (expected_peers == 0)
     return;
 
+  // Pack node_id into a 4-byte buffer
+  uint32_t net_id = htonl(self_config.id);
+  uint8_t req_buf[4];
+  std::memcpy(req_buf, &net_id, 4);
+
   // Broadcast finshed signal to all other nodes
   for (const NodeConfig& peer : cluster_map) {
     if (peer.id == self_config.id)
@@ -254,9 +259,10 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
     // But if the peer has ALREADY finished and exited, the connection will 
     // be refused. We cap retries at 5 to prevent infinite exit deadlocks.
     while (!success && retries < 5) {
+      // Send 4 bytes of payload
       success = send_single_request(peer.id, peer.ip, peer.port, 
                                     CommandType::CMD_EXIT_BARRIER, 
-                                    nullptr, 0, 
+                                    req_buf, 4, 
                                     &ack, 1);
       
       if (!success) {
@@ -266,9 +272,14 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
     }
   }
 
-  // Wait until all peers have broadcasted finished flag to current node
-  while (exit_barrier_count.load(std::memory_order_acquire) < expected_peers) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // Wait until the unique set of exited peers reaches the required size
+  while (true) {
+    {
+      std::lock_guard<std::mutex> lock(exit_mtx);
+      if (exited_peers.size() >= expected_peers) 
+        break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
   // Hardware propagation delay to ensure final TCP ACKs clear the NIC
@@ -1196,9 +1207,23 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       }
 
       case CommandType::CMD_EXIT_BARRIER: {
-        // Increment the count of peers that have finished their workload
-        exit_barrier_count.fetch_add(1, std::memory_order_release);
-        
+        // Read the 4-byte payload containing the sender's node ID
+        uint8_t buf[4];
+        if (!recv_n_bytes(client_socket, buf, 4)) [[unlikely]] {
+          log_error("Failed to read node id for exit barrier", errno);
+          goto cleanup;
+        }
+
+        uint32_t net_id;
+        std::memcpy(&net_id, buf, 4);
+        uint32_t worker_id = ntohl(net_id);
+
+        // Idempotent insertion: if it retries, it just overwrites the same ID
+        {
+          std::lock_guard<std::mutex> lock(exit_mtx);
+          exited_peers.insert(worker_id);
+        }
+
         uint8_t ack = 1;
         if (send(client_socket, &ack, 1, MSG_NOSIGNAL) != 1) [[unlikely]] {
           log_error("Failed to send exit barrier ack", errno);

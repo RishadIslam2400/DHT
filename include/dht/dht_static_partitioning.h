@@ -169,7 +169,8 @@ public:
   void wait_for_barrier();
 
   // All-to-all broadcast barrier to prevent early shutdown connection drops
-  std::atomic<size_t> exit_barrier_count{0};
+  std::mutex exit_mtx;
+  std::set<int> exited_peers;
   void wait_for_exit_barrier();
 
   inline uint64_t increment_logical_clock() {
