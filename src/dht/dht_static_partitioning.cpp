@@ -1269,7 +1269,7 @@ void StaticClusterDHTNode::listen_loop() {
   }
 
   // mark the socket to listen state
-  if (listen(server_fd, 128) < 0) {
+  if (listen(server_fd, SOMAXCONN) < 0) {
     log_error("Error listening on socket: ", errno);
     return;
   }
@@ -1289,6 +1289,13 @@ void StaticClusterDHTNode::listen_loop() {
       // Check if we are shutting down
       if (errno == EINVAL || errno == EBADF || !running) {
           break; 
+      }
+
+      if (errno == EMFILE || errno == ENFILE) {
+          log_error("CRITICAL: Node ran out of File Descriptors!", errno);
+          // Sleep to let the OS naturally close old TIME_WAIT sockets and free up FDs
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          continue;
       }
 
       // Log other errors but keep listening
