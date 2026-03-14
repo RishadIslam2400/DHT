@@ -305,6 +305,7 @@ bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size
 
     if (received == 0) {
       // EOF detected
+      errno = ECONNRESET; // "Connection reset by peer"
       return false;
     }
 
@@ -371,7 +372,7 @@ bool StaticClusterDHTNode::send_single_request(const int target_id,
   // Get a active connection from the pool or create a new connection
   int sock = connection_pool.get_connection(target_id, target_ip, target_port);
   if (sock < 0) {
-    log_error("Invalid Socket", errno);
+    // log_error("Invalid Socket", errno);
     return false;
   }
 
@@ -390,7 +391,7 @@ bool StaticClusterDHTNode::send_single_request(const int target_id,
 
   sock = connection_pool.get_connection(target_id, target_ip, target_port);
   if (sock < 0) {
-    log_error("Invalid Socket", errno);
+    // log_error("Invalid Socket", errno);
     return false;
   }
 

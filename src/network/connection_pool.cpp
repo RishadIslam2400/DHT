@@ -47,12 +47,25 @@ int ConnectionPool::create_new_connection(const std::string &target_ip, const in
   int opt = 1;
   setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-  if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) < 0) {
-    log_error("Connection failure", errno);
-    close(sock);
-    return -1;
+  // Bounded Retry Loop for connection establishment
+  int max_retries = 5;
+  for (int attempts = 0; attempts < max_retries; ++attempts) {
+    if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) == 0) {
+      return sock;
+    }
+    
+    // If it's a hard error (not a busy refusal), stop trying
+    if (errno != ECONNREFUSED && errno != EAGAIN && errno != ETIMEDOUT) {
+      break;
+    }
+    
+    // Sleep to give the target node's CPU time to clear its `accept()` backlog
+    std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1 << attempts)));
   }
-  return sock;
+
+  log_error("Connection failure after retries", errno);
+  close(sock);
+  return -1;
 }
 
 // Check if the queue has an idle socket. If yes, pop it. If no, create a new one.
