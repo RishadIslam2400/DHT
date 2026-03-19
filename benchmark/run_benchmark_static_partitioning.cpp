@@ -18,7 +18,7 @@ std::vector<std::chrono::high_resolution_clock::time_point> thread_end_times;
 enum class OpType { 
   GET, 
   PUT, 
-  MULTI_PUT 
+  MULTI_PUT
 };
 
 struct OpData {
@@ -55,10 +55,34 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
     } 
     else {
       op.type = OpType::MULTI_PUT;
-      // Generate exactly 3 keys for the 2PC transaction
-      for (int k = 0; k < 3; ++k) {
+
+      // Generate unique keys. Bound it safely in case key_range < 3.
+      int num_keys = std::min(3, key_range);
+      for (int k = 0; k < num_keys; ++k) {
+        uint32_t candidate_key;
+        bool is_duplicate;
+
+        do {
+          is_duplicate = false;
+          candidate_key = key_dist(rng);
+
+          // Check against previously generated keys in this specific batch
+          for (int prev = 0; prev < k; ++k) {
+            if (op.key[prev] == candidate_key) {
+              is_duplicate = true;
+              break;
+            }
+          }
+        } while (is_duplicate);
+
         op.key[k] = key_dist(rng);
         op.val[k] = val_dist(rng);
+      }
+
+      // Pad remaining slots to avoid uninitialized data if key_range < 3
+      for (int k = num_keys; k < 3; ++k) {
+        op.key[k] = op.key[0]; 
+        op.val[k] = op.val[0];
       }
     }
     operations.push_back(op);
@@ -90,10 +114,13 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
       batcher.put_sync(op.key[0], op.val[0]);
     } 
     else {
-      std::vector<std::pair<uint32_t, uint32_t>> batch(3);
-      batch[0] = {op.key[0], op.val[0]};
-      batch[1] = {op.key[1], op.val[1]};
-      batch[2] = {op.key[2], op.val[2]};
+      // Strip padded dummy keys from the batch execution if key_range < 3
+      int num_unique = std::min(3, key_range);
+      std::vector<std::pair<uint32_t, uint32_t>> batch(num_unique);
+      
+      for (int k = 0; k < num_unique; ++k) {
+        batch[k] = {op.key[k], op.val[k]};
+      }
       batcher.multi_put(batch);
     }
   }

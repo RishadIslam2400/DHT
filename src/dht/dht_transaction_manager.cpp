@@ -207,20 +207,6 @@ GetResponse DHTTransactionManager::get_sync(const uint32_t& key) {
 bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint32_t>> &kv_pairs) {
   int attempt = 0;
 
-  // Deduplicate keys within the batch (Last-Write-Wins)
-  // If the benchmark PRNG accidentally generates the same key twice in a tight range (Range=10),
-  // we collapse it to save network bandwidth and prevent self-collision locks.
-  /* std::vector<std::pair<uint32_t, uint32_t>> deduped_pairs;
-  for (const auto& kv : kv_pairs) {
-    auto it = std::find_if(deduped_pairs.begin(), deduped_pairs.end(), 
-                           [&](const auto& p) { return p.first == kv.first; });
-    if (it != deduped_pairs.end()) {
-      it->second = kv.second; // Update to the newest value
-    } else {
-      deduped_pairs.push_back(kv);
-    }
-  } */
-
   // Pre-allocate tracking vectors
   size_t num_nodes = dht_node.cluster_map.size();
   std::vector<std::vector<std::pair<uint32_t, uint32_t>>> cohorts(num_nodes);

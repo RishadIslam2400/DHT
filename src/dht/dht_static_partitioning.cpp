@@ -1292,8 +1292,8 @@ void StaticClusterDHTNode::listen_loop() {
 
   std::cout << "Node listening on port " << self_config.port << "..." << std::endl;
 
-  // server_fd socket accepts incoming connections in a persistent loop
-  while (true) {
+  // server_fd socket accepts incoming connections in a persistent loop until the system is running
+  while (running.load(std::memory_order_relaxed)) {
     // initialize client address to store client information
     sockaddr_in client_addr = {0};
     socklen_t client_addr_len = sizeof(client_addr);
@@ -1326,18 +1326,37 @@ void StaticClusterDHTNode::listen_loop() {
       continue;
     }
 
+#ifndef NDEBUG
     char clientname[1024];
     std::cout << "Connected to "
               << inet_ntop(AF_INET, &client_addr.sin_addr, clientname, sizeof(clientname))
               << std::endl;
+#endif
 
-    std::thread client_thread(&StaticClusterDHTNode::handle_client, this, new_socket);
-    
-    // Safely track the socket and thread for graceful shutdown
-    {
-      std::lock_guard<std::mutex> lock(thread_mutex);
-      active_sockets.push_back(new_socket);
-      client_threads.push_back(std::move(client_thread));
+    try {
+      // Fire-and-forget lambda wrapper for automatic socket cleanup
+      std::thread ([this, new_socket]() {
+        // Thread registers its own socket
+        {
+          std::lock_guard<std::mutex> lock(thread_mutex);
+          active_sockets.push_back(new_socket);
+        }
+
+        // Execute the handle client workload
+        this->handle_client(new_socket);
+
+        // Thread cleans up its own socket upon exit to prevent memory leaks
+        {
+          std::lock_guard<std::mutex> lock(this->thread_mutex);
+          auto it = std::find(this->active_sockets.begin(), this->active_sockets.end(), new_socket);
+          if (it != this->active_sockets.end()) {
+            this->active_sockets.erase(it);
+          }
+        }
+      }).detach(); // Detach allows the OS to immediately reclaim the thread's stack memory
+    } catch (const std::system_error& e) {
+      log_error("CRITICAL: OS refused to spawn more threads! Dropping connection.", errno);
+      close(new_socket);
     }
   }
 }
