@@ -8,6 +8,7 @@
 #include <set>
 #include <memory>
 #include <atomic>
+#include <array>
 
 #include "node_properties.h"
 #include "common/dht_common.h"
@@ -56,18 +57,21 @@ private:
   // Global Lamport Clock
   alignas(64) std::atomic<uint64_t> logical_clock{0};
 
-  // Non-blocking spinlock to protect the 2PC staging area
-  alignas(64) Spinlock tx_spinlock;
+  size_t num_logical_stripes;
+  size_t logical_stripe_mask;
 
-  // Tracks keys currently locked by active Phase 1 PREPARE requests
-  std::vector<uint32_t> logically_locked_keys;
+  // Dynamically allocated arrays for the logical state
+  std::unique_ptr<Spinlock[]> stripe_locks;
+  std::vector<std::unordered_set<uint32_t>> logically_locked_stripes;
   
   // Holds data payloads that have passed Phase 1 validation but await Phase 2 COMMIT
   struct StagedTx {
     uint64_t tx_timestamp;
     std::vector<std::pair<uint32_t, uint32_t>> batch;
   };
-  std::vector<StagedTx> staging_area;
+
+  std::unique_ptr<Spinlock[]> staging_locks;
+  std::vector<std::vector<StagedTx>> staging_stripes;
 
   /// Routing
   inline uint64_t hash_key(const std::string &key) const {

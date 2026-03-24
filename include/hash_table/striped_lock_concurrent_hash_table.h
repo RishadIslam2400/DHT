@@ -100,13 +100,15 @@ public:
       num_locks <<= 1; // Bitwise shift left (multiply by 2)
     }
 
-    // Ensure capacity is a multiple of locks.
+    int target_capacity = size * 2;
+
+    // Ensure capacity is a strict multiple of the calculated power-of-2 num_locks.
     // This guarantees that when we double capacity, the lock mapping stays stable.
-    if (size % locks != 0) {
-      size += (locks - (size % locks));
+    if (target_capacity % locks != 0) {
+      target_capacity += (num_locks - (target_capacity % num_locks));
     }
 
-    capacity = size;
+    capacity = target_capacity;
     table.resize(capacity);
     table_mutexes = std::make_unique<AlignedLock[]>(num_locks);
   }

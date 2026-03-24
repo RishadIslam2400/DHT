@@ -12,14 +12,7 @@ private:
   size_t head = 0;
   size_t tail = 0;
 
-public:
-  // Initialize with an 8KB buffer (standard OS page size multiple)
-  BufferedSocket(int socket_fd, size_t capacity = 8192) : sock(socket_fd) {
-    buffer.resize(capacity);
-  }
-
-  // Drop-in replacement for recv_n_bytes
-  bool read_bytes(uint8_t* out_buffer, size_t n) {
+  bool ensure_bytes(size_t n) {
     // Loop until we have at least 'n' unparsed bytes in local RAM
     while (tail - head < n) {
       // If we are out of space at the end of the vector, compact it by 
@@ -50,12 +43,22 @@ public:
       tail += bytes_read;
     }
 
-    // We now have the data entirely in user-space RAM.
-    // Copy it to the parsing variables and advance the head pointer.
-    if (out_buffer) {
-      std::memcpy(out_buffer, buffer.data() + head, n);
-    }
-    head += n;
     return true;
+  }
+
+public:
+  // Initialize with an 8KB buffer (standard OS page size multiple)
+  BufferedSocket(int socket_fd, size_t capacity = 8192) : sock(socket_fd) {
+    buffer.resize(capacity);
+  }
+
+  // Zero-copy read: Returns a pointer directly into the internal buffer
+  uint8_t* read_ptr(size_t n) {
+    if (!ensure_bytes(n)) {
+      return nullptr;
+    }
+    uint8_t* ptr = buffer.data() + head;
+    head += n;
+    return ptr;
   }
 };

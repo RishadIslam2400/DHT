@@ -198,7 +198,7 @@ function cl_benchmark() {
     rm -rf "$LOG_DIR"
     mkdir -p "$LOG_DIR"
 
-    REPLICATION_DEGREES=(2 3)
+    REPLICATION_DEGREES=(1 2 3)
     KEY_RANGES=(10 100 1000 10000)
     THREAD_COUNTS=(1 2 4 8 16 32)
     RUNS=3

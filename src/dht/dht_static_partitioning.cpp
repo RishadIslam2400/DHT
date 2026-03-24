@@ -1,6 +1,7 @@
 #include "dht/dht_static_partitioning.h"
 #include "common/xxHash64.h"
 #include "common/utils.h"
+#include "network/buffered_socket.h"
 
 #include <cstring>
 #include <unistd.h>
@@ -21,9 +22,22 @@ StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConf
     connection_pool(cluster_map.size()),
     benchmark_ready{false}
 {
-  // Pre-allocate to prevent heap fragmentation during runtime
-  logically_locked_keys.reserve(1024);
-  staging_area.reserve(128);
+  // Calculate optimal logical stripes based on key_range (hash_table_size)
+  // Cap at 4096 to prevent allocating excessive memory for massive key ranges.
+  size_t target_stripes = std::min(static_cast<size_t>(2* hash_table_size), static_cast<size_t>(4096));
+
+  // key range 10, 100, 1000, 100000: 32, 256, 2048, 4096
+  num_logical_stripes = 1;
+  while (num_logical_stripes < target_stripes) {
+      num_logical_stripes <<= 1;
+  }
+  logical_stripe_mask = num_logical_stripes - 1;
+
+  stripe_locks = std::make_unique<Spinlock[]>(num_logical_stripes);
+  logically_locked_stripes.resize(num_logical_stripes);
+
+  staging_locks = std::make_unique<Spinlock[]>(num_logical_stripes);
+  staging_stripes.resize(num_logical_stripes);
 
   std::cout << "Booted Node " << self_config.id
             << " (" << self_config.ip << ":" << self_config.port << ")" << std::endl;
@@ -303,7 +317,6 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
 } 
 
 // -------------------------------Utility Functions------------------------------------
-
 bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size_t n) {
   size_t total_read = 0;
   char *buf_ptr = static_cast<char *>(buffer);
@@ -515,14 +528,16 @@ PutResult StaticClusterDHTNode::put_local(const uint32_t& key, const uint32_t& v
                                           const uint64_t &timestamp) {
   constexpr int MAX_RETRIES = 1000;
   uint16_t attempt = 0;
+  size_t stripe = std::hash<uint32_t>{}(key) & logical_stripe_mask;
 
   // Bounded Spin-Wait: Pauses physical insertion if the key is currently 
   // logically locked by an active 2PC Phase 1 transaction.
   while (true) {
     bool is_locked = false;
     {
-      std::lock_guard<Spinlock> lock(tx_spinlock);
-      if (std::ranges::find(logically_locked_keys, key) != logically_locked_keys.end()) {
+      // Lock only the specific stripe, not the whole node
+      std::lock_guard<Spinlock> lock(stripe_locks[stripe]);
+      if (logically_locked_stripes[stripe].find(key) != logically_locked_stripes[stripe].end()) {
         is_locked = true;
       }
     }
@@ -539,6 +554,8 @@ PutResult StaticClusterDHTNode::put_local(const uint32_t& key, const uint32_t& v
     if (attempt < 100) {
       #if defined(__x86_64__)
         __builtin_ia32_pause(); // Hint to CPU to optimize pipeline during spin
+      #else
+        std::this_thread::yield(); // Cross-platform fallback for ARM/AArch64
       #endif
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(5)); // Yield to OS scheduler
@@ -655,25 +672,45 @@ GetResponse StaticClusterDHTNode::get_remote(const uint32_t &key, const uint64_t
 bool StaticClusterDHTNode::local_tx_prepare(const uint64_t &tx_timestamp,
                                             const std::vector<std::pair<uint32_t, uint32_t>> &batch)
 {
-  // Acquire global spinlock to check for overlapping active transactions
-  {
-    std::lock_guard<Spinlock> lock(tx_spinlock);
+  // Map keys to their required lock stripes
+  std::vector<size_t> required_stripes;
+  required_stripes.reserve(batch.size());
+  for (const auto& kv : batch) {
+    required_stripes.push_back(std::hash<uint32_t>{}(kv.first) & logical_stripe_mask);
+  }
 
-    // Lock collision check
-    for (const auto& kv : batch) {
-      if (std::ranges::find(logically_locked_keys, kv.first) != logically_locked_keys.end()) {
-        stats.tx_prepare_rejected_locked.fetch_add(1, std::memory_order_relaxed);
-        return false; // Key is locked
-      }
+  // Global order for the stripes
+  std::sort(required_stripes.begin(), required_stripes.end());
+  required_stripes.erase(std::unique(required_stripes.begin(), required_stripes.end()), required_stripes.end());
+
+  // Acquire stripe locks in strict ascending order
+  for (size_t stripe : required_stripes) {
+    stripe_locks[stripe].lock();
+  }
+
+  // Lock collision check
+  bool collision = false;
+  for (const auto& kv : batch) {
+    size_t stripe =  std::hash<uint32_t>{}(kv.first) & logical_stripe_mask;
+    if (logically_locked_stripes[stripe].find(kv.first) != logically_locked_stripes[stripe].end()) {
+      collision = true;
+      break;
+    }
+  }
+
+  // Rollback if a key is already locked
+  if (collision) {
+    stats.tx_prepare_rejected_locked.fetch_add(1, std::memory_order_relaxed);
+
+    // release locks
+    for (auto it = required_stripes.rbegin(); it != required_stripes.rend(); ++it) {
+      stripe_locks[*it].unlock();
     }
 
-    // Optimistically claim the locks so other threads/network requests cannot touch these keys
-    for (const auto& kv : batch) {
-      logically_locked_keys.push_back(kv.first);
-    }
-  } // release spinlock
+    return false;
+  }
 
-  // Validate LWW Timestamps against the physical storage layer
+  // Validate LWW Timestamps while safely holding the logical locks
   bool is_obsolete = false;
   for (const auto& kv : batch) {
     uint64_t current_ts = storage.get_timestamp(kv.first);
@@ -685,25 +722,30 @@ bool StaticClusterDHTNode::local_tx_prepare(const uint64_t &tx_timestamp,
 
   // Rollback logical locks if LWW validation failed
   if (is_obsolete) {
-    std::lock_guard<Spinlock> lock(tx_spinlock);
-    for (const auto& kv : batch) {
-      auto it = std::ranges::find(logically_locked_keys, kv.first);
-      if (it != logically_locked_keys.end()) {
-        if (it != logically_locked_keys.end() - 1) {
-          *it = logically_locked_keys.back();
-        }
-        logically_locked_keys.pop_back();
-      }
-    }
-
     stats.tx_prepare_rejected_obsolete.fetch_add(1, std::memory_order_relaxed);
+    for (auto it = required_stripes.rbegin(); it != required_stripes.rend(); ++it) {
+      stripe_locks[*it].unlock();
+    }
     return false;
   }
 
-  // Validation passed. Move payload to Staging Area awaiting Phase 2 Commit.
+  // Optimistically claim the locks in their respective stripes
+  for (const auto& kv : batch) {
+    size_t stripe = std::hash<uint32_t>{}(kv.first) & logical_stripe_mask;
+    logically_locked_stripes[stripe].insert(kv.first);
+  }
+
+  // Push to the sharded staging area
+  // We shard by tx_timestamp so Phase 2 commits do not bottleneck on key lock contention
+  size_t staging_stripe = tx_timestamp & logical_stripe_mask;
   {
-    std::lock_guard<Spinlock> lock(tx_spinlock);
-    staging_area.push_back({tx_timestamp, batch});
+    std::lock_guard<Spinlock> stage_lock(staging_locks[staging_stripe]);
+    staging_stripes[staging_stripe].push_back({tx_timestamp, batch});
+  }
+
+  // Release striped key locks in reverse order
+  for (auto it = required_stripes.rbegin(); it != required_stripes.rend(); ++it) {
+    stripe_locks[*it].unlock();
   }
 
   return true;
@@ -711,25 +753,28 @@ bool StaticClusterDHTNode::local_tx_prepare(const uint64_t &tx_timestamp,
 
 // PHASE 2 (Success): Extract from staging area and apply to physical storage
 void StaticClusterDHTNode::local_tx_commit(const uint64_t &tx_timestamp) {
+  // Route to the correct staging shard
+  size_t staging_stripe = tx_timestamp & logical_stripe_mask;
   std::vector<std::pair<uint32_t, uint32_t>> batch_to_commit;
-  
-  // Acquire the spinlock to steal the transaction from the staging area
+
+  // Extract the transaction from the staging area
   {
-    std::lock_guard<Spinlock> lock(tx_spinlock);
+    std::lock_guard<Spinlock> stage_lock(staging_locks[staging_stripe]);
+    auto &stripe_vector = staging_stripes[staging_stripe];
 
-    auto it = std::ranges::find_if(staging_area, [&tx_timestamp](const StagedTx& tx) {
-      return tx.tx_timestamp == tx_timestamp;
-    });
+    for (auto it = stripe_vector.begin(); it != stripe_vector.end(); ++it) {
+      if (it->tx_timestamp == tx_timestamp) {
+        batch_to_commit = std::move(it->batch);
 
-    if (it != staging_area.end()) [[likely]] {
-      batch_to_commit = std::move(it->batch); 
+        if (it != stripe_vector.end() - 1) {
+          *it = std::move(stripe_vector.back());
+        }
 
-      if (it != staging_area.end() - 1) {
-        *it = std::move(staging_area.back());
+        stripe_vector.pop_back();
+        break;
       }
-      staging_area.pop_back();
     }
-  } // Release spinlock
+  } // Release stage lock
 
   if (batch_to_commit.empty()) [[unlikely]] {
     return; // Safety guard against duplicate commits
@@ -745,16 +790,11 @@ void StaticClusterDHTNode::local_tx_commit(const uint64_t &tx_timestamp) {
   }
 
   // Release the logical locks to allow new transactions
-  {
-    std::lock_guard<Spinlock> lock(tx_spinlock);
+  for (const auto& kv : batch_to_commit) {
+    size_t lock_stripe = std::hash<uint32_t>{}(kv.first) & logical_stripe_mask;
     
-    for (const auto& kv : batch_to_commit) {
-      auto lock_it = std::ranges::find(logically_locked_keys, kv.first);
-      if (lock_it != logically_locked_keys.end()) {
-        *lock_it = logically_locked_keys.back();
-        logically_locked_keys.pop_back();
-      }
-    }
+    std::lock_guard<Spinlock> lock(stripe_locks[lock_stripe]);
+    logically_locked_stripes[lock_stripe].erase(kv.first);
   }
 
   stats.local_tx_committed.fetch_add(1, std::memory_order_relaxed);
@@ -762,37 +802,37 @@ void StaticClusterDHTNode::local_tx_commit(const uint64_t &tx_timestamp) {
 
 // PHASE 2 (Failure): Coordinator ordered rollback
 void StaticClusterDHTNode::local_tx_abort(const uint64_t &tx_timestamp) {
-  std::vector<std::pair<uint32_t, uint32_t>> discarded_batch;
+  size_t staging_stripe = tx_timestamp & logical_stripe_mask;
+  std::vector<std::pair<uint32_t, uint32_t>> batch_to_abort;
 
+  // Extract and remove the transaction from the staging area
   {
-    std::lock_guard<Spinlock> lock(tx_spinlock);
-
-    auto it = std::ranges::find_if(staging_area, [&tx_timestamp](const StagedTx& tx) {
-      return tx.tx_timestamp == tx_timestamp;
-    });
-
-    if (it != staging_area.end()) {
-      // Steal the transaction batch
-      discarded_batch = std::move(it->batch);
-
-      // Roll back the tx from the staging area
-      if (it != staging_area.end() - 1) {
-        *it = std::move(staging_area.back());
-      }
-      staging_area.pop_back();
-
-      // Release logical locks on the keys
-      for (const auto& kv : discarded_batch) {
-        auto lock_it = std::ranges::find(logically_locked_keys, kv.first);
-        if (lock_it != logically_locked_keys.end()) {
-          if (lock_it != logically_locked_keys.end() - 1) {
-            *lock_it = logically_locked_keys.back();
-          }
-          logically_locked_keys.pop_back();
+    std::lock_guard<Spinlock> stage_lock(staging_locks[staging_stripe]);
+    auto& stripe_vector = staging_stripes[staging_stripe];
+    
+    for (auto it = stripe_vector.begin(); it != stripe_vector.end(); ++it) {
+      if (it->tx_timestamp == tx_timestamp) {
+        batch_to_abort = std::move(it->batch);
+        
+        if (it != stripe_vector.end() - 1) {
+          *it = std::move(stripe_vector.back());
         }
+        stripe_vector.pop_back();
+        break;
       }
     }
-  } // release spinlock
+  } // release stage lock
+
+  if (batch_to_abort.empty())
+    return;
+
+  // Release logical locks
+  for (const auto& kv : batch_to_abort) {
+    size_t lock_stripe = std::hash<uint32_t>{}(kv.first) & logical_stripe_mask;
+    
+    std::lock_guard<Spinlock> lock(stripe_locks[lock_stripe]);
+    logically_locked_stripes[lock_stripe].erase(kv.first);
+  }
 
   stats.local_tx_aborted.fetch_add(1, std::memory_order_relaxed);
   // discarded_batch vector goes out of scope
@@ -911,19 +951,18 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
   // tv.tv_sec = 300;
   // tv.tv_usec = 0;
   // setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
-
-  uint8_t cmd_buf;
+  
+  // Wrap the raw socket in our User-Space buffer
+  BufferedSocket buffered_sock(client_socket);
 
   // Pre-allocate dynamic buffers to prevent heap fragmentation during rapid parsing
-  std::vector<uint8_t> tx_batch_buf;
-  tx_batch_buf.reserve(BATCH_SIZE * 8);
-
   std::vector<std::pair<uint32_t, uint32_t>> tx_batch;
   tx_batch.reserve(BATCH_SIZE);
 
-  while (running) {
-    // Both the batch request and single request has a command type in the first byte
-    if (!recv_n_bytes(client_socket, &cmd_buf, 1)) [[unlikely]] {
+  while (running.load(std::memory_order_relaxed)) {
+    // Zero copy read for the command byte
+    uint8_t* cmd_ptr = buffered_sock.read_ptr(1);
+    if (!cmd_ptr) [[unlikely]] {
       #ifndef NDEBUG
         if (running && errno != 0 && errno != ECONNRESET) {
           log_error("Could not read command byte", errno);
@@ -932,7 +971,7 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       break;
     }
 
-    CommandType cmd = static_cast<CommandType>(cmd_buf);
+    CommandType cmd = static_cast<CommandType>(*cmd_ptr);
 
     // Clients wants to disconnect
     if (cmd == CommandType::CMD_QUIT) [[unlikely]] {
@@ -943,17 +982,17 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
     switch(cmd) {
       case CommandType::CMD_PUT: {
         // Read 16 Bytes: [Key:4][Value:4][Timestamp:8]
-        uint8_t buf[16];
-        if (!recv_n_bytes(client_socket, buf, 16)) [[unlikely]] {
+        uint8_t* buf_ptr = buffered_sock.read_ptr(16);
+        if (!buf_ptr) [[unlikely]] {
           log_error("Failed to read PUT request", errno);
           goto cleanup;
         }
 
         uint32_t net_key, net_value;
         uint64_t net_ts;
-        std::memcpy(&net_key, buf, 4);
-        std::memcpy(&net_value, buf + 4, 4);
-        std::memcpy(&net_ts, buf + 8, 8);
+        std::memcpy(&net_key, buf_ptr, 4);
+        std::memcpy(&net_value, buf_ptr + 4, 4);
+        std::memcpy(&net_ts, buf_ptr + 8, 8);
 
         uint32_t key = ntohl(net_key);
         uint32_t value = ntohl(net_value);
@@ -974,16 +1013,16 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
       case CommandType::CMD_GET: {
         // Read 12 bytes: [Key:4][Read_Timestamp:8]
-        uint8_t buf[12];
-        if (!recv_n_bytes(client_socket, buf, 12)) [[unlikely]] {
+        uint8_t* buf_ptr = buffered_sock.read_ptr(12);
+        if (!buf_ptr) [[unlikely]] {
           log_error("Failed to read GET request", errno);
           goto cleanup;
         }
 
         uint32_t net_key;
         uint64_t net_ts;
-        std::memcpy(&net_key, buf, 4);
-        std::memcpy(&net_ts, buf + 4, 8);
+        std::memcpy(&net_key, buf_ptr, 4);
+        std::memcpy(&net_ts, buf_ptr + 4, 8);
 
         uint32_t key = ntohl(net_key);
         uint64_t read_ts = be64toh(net_ts);
@@ -1019,18 +1058,17 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       }
 
       case CommandType::CMD_BATCH_PUT: {
-        // Array of async puts flushed from a client buffer
-        uint8_t request_buffer[BATCH_SIZE * 16];
-        uint8_t response_buffer[BATCH_SIZE];
-
         // Read Batch Count (2 bytes)
-        uint16_t batch_count_net;
-        if (!recv_n_bytes(client_socket, &batch_count_net, 2)) [[unlikely]] {
+        uint8_t* count_ptr = buffered_sock.read_ptr(2);
+        if (!count_ptr) [[unlikely]] {
           log_error("Failed to read batch count", errno);
           goto cleanup;
         }
 
-        uint16_t batch_count = ntohs(batch_count_net);
+        uint16_t net_count;
+        std::memcpy(&net_count, count_ptr, 2);
+        uint16_t batch_count = ntohs(net_count);
+
         if (batch_count > BATCH_SIZE) [[unlikely]] {
           std::cerr << "Invalid batch size: " << batch_count << "\n";
           goto cleanup;
@@ -1038,12 +1076,13 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
         // Read batch requests
         size_t total_req_bytes = batch_count * 16;
-        if (!recv_n_bytes(client_socket, request_buffer, total_req_bytes)) [[unlikely]] {
+        uint8_t* req_ptr = buffered_sock.read_ptr(total_req_bytes);
+        if (!req_ptr) [[unlikely]] {
           log_error("Failed to read batched requests", errno);
           goto cleanup;
         }
 
-        uint8_t* req_ptr = request_buffer;
+        uint8_t response_buffer[BATCH_SIZE];
         uint8_t* resp_ptr = response_buffer;
 
         for (int i = 0; i < batch_count; ++i) {
@@ -1076,26 +1115,26 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       case CommandType::CMD_TX_PREPARE: {
         // 2PC Phase 1: Lock keys and validate LWW timestamps
         // Read the 10 byte header
-        uint8_t header_buf[10];
-        if (!recv_n_bytes(client_socket, &header_buf, 10)) [[unlikely]] {
+        uint8_t* header_ptr = buffered_sock.read_ptr(10);
+        if (!header_ptr) [[unlikely]] {
           log_error("Failed to read TX_PREPARE header", errno);
           goto cleanup;
         }
 
         uint64_t net_tx_ts;
         uint16_t net_batch_size;
-        std::memcpy(&net_tx_ts, header_buf, 8);
-        std::memcpy(&net_batch_size, header_buf + 8, 2);
+        std::memcpy(&net_tx_ts, header_ptr, 8);
+        std::memcpy(&net_batch_size, header_ptr + 8, 2);
 
         uint64_t tx_timestamp = be64toh(net_tx_ts);
         uint16_t batch_size = ntohs(net_batch_size);
 
         synchronize_clock(tx_timestamp);
 
-        // Read the batch data [Key:4][Value:4] per item
-        tx_batch_buf.resize(batch_size * 8);
-        if (!recv_n_bytes(client_socket, tx_batch_buf.data(), batch_size * 8))
-        [[unlikely]] {
+        // Zero-Copy pointer to the batch data inside the socket buffer
+        size_t batch_bytes = batch_size * 8;
+        uint8_t* batch_ptr = buffered_sock.read_ptr(batch_bytes);
+        if (!batch_ptr) [[unlikely]] {
           log_error("Failed to read Tx batch", errno);
           goto cleanup;
         }
@@ -1103,8 +1142,8 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         tx_batch.clear(); // Resets size to 0 without freeing memory
         for (size_t i = 0; i < batch_size; ++i) {
           uint32_t net_k, net_v;
-          std::memcpy(&net_k, tx_batch_buf.data() + (i * 8), 4);
-          std::memcpy(&net_v, tx_batch_buf.data() + (i * 8) + 4, 4);
+          std::memcpy(&net_k, batch_ptr + (i * 8), 4);
+          std::memcpy(&net_v, batch_ptr + (i * 8) + 4, 4);
           tx_batch.emplace_back(ntohl(net_k), ntohl(net_v));
         }
 
@@ -1114,8 +1153,6 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         // Pack 9-byte response: [Vote:1][CurrentClock:8]
         uint8_t response_buf[9];
         response_buf[0] = prepared ? 1 : 0;
-
-        // Read our current clock and append it to the response
         uint64_t current_clock = htobe64(logical_clock.load(std::memory_order_relaxed));
         std::memcpy(response_buf + 1, &current_clock, 8);
 
@@ -1127,14 +1164,14 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       }
 
       case CommandType::CMD_TX_COMMIT: {
-        uint8_t ts_buf[8];
-        if (!recv_n_bytes(client_socket, ts_buf, 8)) [[unlikely]] {
+        uint8_t* ts_ptr = buffered_sock.read_ptr(8);
+        if (!ts_ptr) [[unlikely]] {
           log_error("Failed to read TX_COMMIT timestamp", errno);
           goto cleanup;
         }
 
         uint64_t net_tx_ts;
-        std::memcpy(&net_tx_ts, ts_buf, 8);
+        std::memcpy(&net_tx_ts, ts_ptr, 8);
         uint64_t tx_timestamp = be64toh(net_tx_ts);
 
         synchronize_clock(tx_timestamp);
@@ -1149,14 +1186,14 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       }
 
       case CommandType::CMD_TX_ABORT: {
-        uint8_t ts_buf[8];
-        if (!recv_n_bytes(client_socket, ts_buf, 8)) [[unlikely]] {
+        uint8_t* ts_ptr = buffered_sock.read_ptr(8);
+        if (!ts_ptr) [[unlikely]] {
           log_error("Failed to read TX_ABORT timestamp", errno);
           goto cleanup;
         }
         
         uint64_t net_tx_ts;
-        std::memcpy(&net_tx_ts, ts_buf, 8);
+        std::memcpy(&net_tx_ts, ts_ptr, 8);
         uint64_t tx_timestamp = be64toh(net_tx_ts);
 
         synchronize_clock(tx_timestamp);        
@@ -1172,14 +1209,14 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
       case CommandType::CMD_BARRIER: {
         // Read the node id of the worker node
-        uint8_t buf[4];
-        if (!recv_n_bytes(client_socket, buf, 4)) [[unlikely]]  {
+        uint8_t* id_ptr = buffered_sock.read_ptr(4);
+        if (!id_ptr) [[unlikely]]  {
           log_error("Failed to read node id for barrier", errno);
           goto cleanup;
         }
 
         uint32_t net_id;
-        std::memcpy(&net_id, buf, 4);
+        std::memcpy(&net_id, id_ptr, 4);
         uint32_t worker_id = ntohl(net_id);
 
         // Add to checkins
@@ -1225,14 +1262,14 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
       case CommandType::CMD_EXIT_BARRIER: {
         // Read the 4-byte payload containing the sender's node ID
-        uint8_t buf[4];
-        if (!recv_n_bytes(client_socket, buf, 4)) [[unlikely]] {
+        uint8_t* id_ptr = buffered_sock.read_ptr(4);
+        if (!id_ptr) [[unlikely]] {
           log_error("Failed to read node id for exit barrier", errno);
           goto cleanup;
         }
 
         uint32_t net_id;
-        std::memcpy(&net_id, buf, 4);
+        std::memcpy(&net_id, id_ptr, 4);
         uint32_t worker_id = ntohl(net_id);
 
         // Idempotent insertion: if it retries, it just overwrites the same ID
