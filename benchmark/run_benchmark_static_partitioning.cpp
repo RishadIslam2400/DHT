@@ -67,7 +67,7 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
           candidate_key = key_dist(rng);
 
           // Check against previously generated keys in this specific batch
-          for (int prev = 0; prev < k; ++k) {
+          for (int prev = 0; prev < k; ++prev) {
             if (op.key[prev] == candidate_key) {
               is_duplicate = true;
               break;
