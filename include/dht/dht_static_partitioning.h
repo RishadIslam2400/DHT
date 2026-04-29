@@ -9,6 +9,7 @@
 #include <memory>
 #include <atomic>
 #include <array>
+#include <vector>
 
 #include "node_properties.h"
 #include "common/dht_common.h"
@@ -17,12 +18,26 @@
 #include "common/spin_lock.h"
 
 // Forward declaration of the template
-// template <typename DHTType>
 class DHTTransactionManager;
 
+// Consensus Protocol Enums
+enum class ConsensusRole {
+  FOLLOWER,
+  CANDIDATE,
+  LEADER
+};
+
+// Represents a single command in a totally ordered log
+struct LogEntry {
+  uint64_t term;         // Paxos ballot number / Raft term
+  CommandType cmd;       // Command type
+  uint64_t tx_timestamp; // Logical clock timestamp
+
+  // Storing the payload: both single put and multi put
+  std::vector<std::pair<uint32_t, uint32_t>> batch;
+};
+
 /// This class represents a single physical server in the distributed cluster.
-/// It is responsible for physical storage, network routing, connection pooling, 
-/// and executing the server-side state machine for Two-Phase Commit (2PC).
 class StaticClusterDHTNode {
 private:
   friend class DHTTransactionManager;
