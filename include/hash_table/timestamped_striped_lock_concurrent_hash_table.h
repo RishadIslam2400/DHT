@@ -6,6 +6,8 @@
 #include <iostream>
 #include <algorithm>
 #include <ranges>
+#include <mutex>
+#include <shared_mutex>
 
 #include "common/xxHash64.h"
 #include "common/dht_common.h"
