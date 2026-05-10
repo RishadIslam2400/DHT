@@ -20,9 +20,6 @@ struct Ht_item {
   uint64_t timestamp; // Logical clock commit timestamp
 };
 
-// alignas(64) ensures each lock sits on its own hardware CPU cache line.
-// This prevents "false sharing," where threads modifying different locks 
-// accidentally invalidate each other's L1 cache.
 struct alignas(64) AlignedLock {
   std::shared_mutex mutex;
 };
@@ -48,7 +45,6 @@ private:
   }
 
   // Uses bitwise AND instead of modulo. 
-  // This mathematically requires num_locks to be a strict power of 2.
   inline int get_lock_index(size_t bucket_index) const {
     return bucket_index & (num_locks - 1);
   }
@@ -76,7 +72,7 @@ public:
     table_mutexes = std::make_unique<AlignedLock[]>(num_locks);
   }
 
-  // Single PUT operation utilizing Last-Write-Wins (LWW)
+  // Single PUT operation using Last-Write-Wins
   PutResult put(const K& key, const V& value, const uint64_t incoming_ts) {
     uint64_t raw_hash = get_raw_hash(key);
     size_t bucket_index = get_bucket_index(raw_hash);

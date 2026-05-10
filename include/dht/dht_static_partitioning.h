@@ -10,35 +10,21 @@
 #include <atomic>
 #include <array>
 #include <vector>
+#include <functional>
 
 #include "node_properties.h"
 #include "common/dht_common.h"
 #include "hash_table/timestamped_striped_lock_concurrent_hash_table.h"
 #include "network/connection_pool.h"
 #include "common/spin_lock.h"
+#include "consensus_interface.h"
 
 // Forward declaration of the template
 class DHTTransactionManager;
 
-// Consensus Protocol Enums
-enum class ConsensusRole {
-  FOLLOWER,
-  CANDIDATE,
-  LEADER
-};
-
-// Represents a single command in a totally ordered log
-struct LogEntry {
-  uint64_t term;         // Paxos ballot number / Raft term
-  CommandType cmd;       // Command type
-  uint64_t tx_timestamp; // Logical clock timestamp
-
-  // Storing the payload: both single put and multi put
-  std::vector<std::pair<uint32_t, uint32_t>> batch;
-};
 
 /// This class represents a single physical server in the distributed cluster.
-class StaticClusterDHTNode {
+class StaticClusterDHTNode : public IStateMachine, public INetworkTransport {
 private:
   friend class DHTTransactionManager;
 
@@ -52,8 +38,6 @@ private:
   int server_fd;
   std::atomic<bool> running;
   std::thread listener_thread;
-
-  // Maintains persistent, pre-warmed TCP sockets to avoid 3-way handshake overhead
   ConnectionPool connection_pool;
 
   // Mechanism for listener thread to gracefully join client threads during shutdown
@@ -61,17 +45,28 @@ private:
   std::vector<std::thread> client_threads;
   std::vector<int> active_sockets;
 
-  // Mechanism for distributed barrier (Synchronized start and shutdown)
+  // Mechanism for distributed barrier
   std::mutex barrier_mtx;
   std::condition_variable barrier_cv;
   std::set<int> barrier_checkins;
   std::atomic<bool> benchmark_ready;
 
-  /// 2PC Concurrency Control Mechanism
+  /// Consensus engine
+  std::unique_ptr<IConsensusEngine> consensus_engine;
 
-  // Global Lamport Clock
+  // IStateMachine Implementation: 
+  // Translates committed raw bytes back into HashTable
+  void apply_committed_log(uint64_t commit_index, const uint8_t* data, size_t data_len) override;
+
+  // INetworkTransport Implementation:
+  // Exposes zero-copy sending to the Consensus Engine
+  void send_message(int target_node_id, ProtocolType proto, uint8_t command_type,
+                    const uint8_t* payload, size_t payload_size) override;
+  std::vector<int> get_peer_ids() const override;
+  int get_self_id() const override { return self_config.id; }
+
+  /// 2PC Concurrency Control Mechanism (Runs on top of Consensus)
   alignas(64) std::atomic<uint64_t> logical_clock{0};
-
   size_t num_logical_stripes;
   size_t logical_stripe_mask;
 
@@ -79,12 +74,11 @@ private:
   std::unique_ptr<Spinlock[]> stripe_locks;
   std::vector<std::unordered_set<uint32_t>> logically_locked_stripes;
   
-  // Holds data payloads that have passed Phase 1 validation but await Phase 2 COMMIT
+  // Holds data payloads that have passed Phase 1 validation but await Phase 2 commit
   struct StagedTx {
     uint64_t tx_timestamp;
     std::vector<std::pair<uint32_t, uint32_t>> batch;
   };
-
   std::unique_ptr<Spinlock[]> staging_locks;
   std::vector<std::vector<StagedTx>> staging_stripes;
 
@@ -128,12 +122,12 @@ private:
   /// Network I/O Primitives
   static bool recv_n_bytes(const int sock, void *buffer, const size_t n);
   // Uses Scatter-Gather (writev) to send a command byte + payload in 1 syscall
-  bool perform_rpc_single_request(const int sock, CommandType cmd,
+  bool perform_rpc_single_request(const int sock, ProtocolType proto, uint8_t cmd,
                                   const uint8_t *request, size_t request_size,
                                   uint8_t *response, size_t response_size);
   // Wraps RPC in a retry loop using the Connection Pool
   bool send_single_request(const int target_id, const std::string &target_ip,
-                           const int target_port, CommandType cmd,
+                           const int target_port, ProtocolType proto, uint8_t cmd,
                            const uint8_t *request, size_t request_size,
                            uint8_t *response, size_t response_size);
   // Sends an array of PutRequests for asynchronous batching
@@ -173,7 +167,8 @@ private:
 
 public:
   explicit StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
-                                int hash_table_size, int num_locks, int rep_degree);
+                                int hash_table_size, int num_locks, int rep_degree,
+                                std::unique_ptr<IConsensusEngine> engine);
   ~StaticClusterDHTNode();
 
   // Lock-free telemetry counters

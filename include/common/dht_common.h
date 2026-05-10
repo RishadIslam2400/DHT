@@ -2,33 +2,66 @@
 
 #include <cstdint>
 
-// Number of async puts to buffer before triggering a network flush.
-// Balances network throughput vs. staleness of uncommitted data.
 constexpr int BATCH_SIZE = 64;
 
-// Defines the network protocol instructions the server socket listens for.
-enum class CommandType : uint8_t {
-  CMD_PING = 0,       // Cluster health check
-  CMD_GO = 1,         // Benchmark synchronization barrier
-  CMD_PUT = 2,        // Single strictly consistent put (put_sync)
-  CMD_GET = 3,        // Single read operation
-  CMD_BATCH_PUT = 4,  // Array of async puts flushed from a client buffer
-  CMD_BARRIER = 5,    // Coordinator sync point
-  CMD_QUIT = 6,       // Shutdown signal
-  CMD_TX_PREPARE = 7, // 2PC Phase 1: Lock keys and validate LWW timestamps
-  CMD_TX_COMMIT = 8,  // 2PC Phase 2: Apply writes to storage and unlock
-  CMD_TX_ABORT = 9,   // 2PC Phase 2: Discard staging area writes and unlock
-  CMD_EXIT_BARRIER = 10
+enum class ProtocolType : uint8_t {
+  ClientDht = 0,
+  TwoPhaseCommit = 1,
+  Paxos = 2,
+  Raft = 3
 };
 
-// Payload for single or batched put operations over the network.
-struct alignas(8) PutRequest {
-  uint32_t key;
-  uint32_t value;
-  uint64_t timestamp;
+enum class DhtCommand : uint8_t {
+  Ping = 0,         // Cluster health check
+  Go = 1,           // Benchmark synchronization barrier
+  Put = 2,          // Single strictly consistent put
+  Get = 3,          // Single read operation
+  BatchPut = 4,     // Array of async puts
+  Barrier = 5,      // Coordinator sync point
+  Quit = 6,         // Shutdown signal
+  ExitBarrier = 7   // Exit sync
+};
 
-  PutRequest() : key(0), value(0), timestamp(0) {}
-  PutRequest(uint32_t k, uint32_t v, uint64_t ts) : key(k), value(v), timestamp(ts) {}
+enum class TwoPhaseCommitCommand : uint8_t {
+  Prepare = 0,      // Phase 1: Lock keys and validate
+  Commit = 1,       // Phase 2: Apply writes to storage
+  Abort = 2         // Phase 2: Discard staging area writes
+};
+
+enum class PaxosCommand : uint8_t {
+  Prepare = 0,      // Leader Election: Propose new ballot
+  Promise = 1,      // Follower replies to Prepare
+  Accept = 2,       // Leader asks to append entry
+  Accepted = 3      // Follower confirms log append
+};
+
+enum class RaftCommand : uint8_t {
+  RequestVote = 0,  // Leader Election phase
+  VoteReply = 1,    // Vote result
+  AppendEntries = 2,// Log replication & heartbeat
+  AppendReply = 3   // Acknowledgment of append
+};
+
+struct NetworkEnvelope {
+  ProtocolType protocol_type;
+  uint8_t command_type;
+  uint16_t payload_size;
+  uint32_t sender_id;
+};
+
+enum class ConsensusRole : uint8_t {
+  FOLLOWER = 0,
+  CANDIDATE = 1,
+  LEADER = 2
+};
+
+struct PutRequest {
+  uint64_t timestamp;
+  uint32_t key; 
+  uint32_t value;
+
+  PutRequest() : timestamp(0), key(0), value(0) {}
+  PutRequest(uint32_t k, uint32_t v, uint64_t ts) : timestamp(ts), key(k), value(v) {}
 };
 
 // Return outcomes for any PUT operation.
@@ -44,13 +77,13 @@ struct PutResponse {
   PutResult status;
 };
 
-// Payload for requesting a value over the network.
-struct alignas(8) GetRequest {
-  uint32_t key;
+struct GetRequest {
   uint64_t timestamp;
+  uint32_t key;
+  uint32_t _padding;
 
-  GetRequest() : key(0), timestamp(0) {}
-  GetRequest(uint32_t k, uint64_t ts) : key(k), timestamp(ts) {}
+  GetRequest() : timestamp(0), key(0), _padding(0) {}
+  GetRequest(uint32_t k, uint64_t ts) : timestamp(ts), key(k), _padding(0) {}
 };
 
 // Return outcomes for GET operations.
@@ -62,22 +95,81 @@ enum class GetStatus : uint8_t {
 
 // Wrapper for GET responses. 
 struct GetResponse {
+  uint32_t value;      // Only valid if status == Found
   GetStatus status;
-  uint32_t value; // Only valid if status == Found
+  uint8_t _padding[3];
 
-  static GetResponse success(uint32_t v) { return {GetStatus::Found, v}; }
-  static GetResponse not_found()    { return {GetStatus::NotFound, 0}; }
-  static GetResponse error()        { return {GetStatus::NetworkError, 0}; }
+  static GetResponse success(uint32_t v) { return {v, GetStatus::Found, {0}}; }
+  static GetResponse not_found()    { return {0, GetStatus::NotFound, {0}}; }
+  static GetResponse error()        { return {0, GetStatus::NetworkError, {0}}; }
 };
 
-// Header sent by the Coordinator during PREPARE Phase.
-struct __attribute__((packed)) TxPrepareHeader {
-  uint64_t tx_timestamp; // The single Lamport clock value defining the transaction's age
-  uint16_t batch_size;   // How many PutRequests immediately follow this header in the stream
+// Header sent by the Coordinator during 2PC PREPARE Phase
+struct TxPrepareHeader {
+  uint64_t tx_timestamp;
+  uint16_t batch_size;   // number of PUT requests
+  uint8_t  _padding[6];  // 6 bytes explicit padding
 };
 
-// Header sent by Coordinator during COMMIT Phase 2.
+// Header sent by Coordinator during 2PC COMMIT Phase
 // Used to identify which transaction in the server's staging_area to commit or abort.
 struct TxCommandHeader {
   uint64_t tx_timestamp;
+};
+
+// Header sent during CMD_PAXOS_PREPARE
+struct PaxosPrepareHeader {
+  uint64_t ballot_number;
+  uint64_t next_slot_index; // Tells followers where the new leader wants to start
+};
+
+// Header sent during CMD_PAXOS_ACCEPT
+struct PaxosAcceptHeader {
+  uint64_t slot_index;
+  uint64_t ballot_number;
+  uint16_t batch_size;    // How many PutRequests are inside the LogEntry payload
+  uint8_t  _padding[6];   // 6 bytes padding
+};
+
+// Acknowledgment sent back to the leader (CMD_PAXOS_ACCEPTED)
+struct PaxosAcceptedHeader {
+  uint64_t slot_index;
+  uint64_t ballot_number;
+  uint32_t ack_node_id;
+  uint32_t _padding;      // 4 bytes padding
+};
+
+// Header sent during RaftCommand::RequestVote
+struct RaftRequestVoteHeader {
+  uint64_t term;
+  uint64_t last_log_index;
+  uint64_t last_log_term;
+  uint32_t candidate_id;
+  uint32_t _padding;
+};
+
+// Reply to a RequestVote
+struct RaftVoteReplyHeader {
+  uint64_t term;
+  uint8_t  vote_granted; // 1 for true, 0 for false
+  uint8_t  _padding[7];
+};
+
+// Header sent during RaftCommand::AppendEntries
+struct RaftAppendEntriesHeader {
+  uint64_t term;
+  uint64_t prev_log_index;
+  uint64_t prev_log_term;
+  uint64_t leader_commit;
+  uint32_t leader_id;
+  uint16_t batch_size;
+  uint16_t _padding;
+};
+
+// Reply to an AppendEntries
+struct RaftAppendReplyHeader {
+  uint64_t term;
+  uint64_t match_index; // If successful, the index the follower appended
+  uint8_t  success;     // 1 for true, 0 for false
+  uint8_t  _padding[7];
 };

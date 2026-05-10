@@ -2,6 +2,7 @@
 #include "common/xxHash64.h"
 #include "common/utils.h"
 #include "network/buffered_socket.h"
+#include "dht/consensus_interface.h"
 
 #include <cstring>
 #include <unistd.h>
@@ -12,7 +13,8 @@
 #include <endian.h>
 
 StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
-                                           int hash_table_size, int num_locks, int rep_deg)
+                                           int hash_table_size, int num_locks, int rep_deg,
+                                          std::unique_ptr<IConsensusEngine> engine)
   : cluster_map{std::move(map)}, 
     self_config{std::move(self)},
     storage{hash_table_size, num_locks},
@@ -20,7 +22,8 @@ StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConf
     server_fd{-1},
     running{false},
     connection_pool(cluster_map.size()),
-    benchmark_ready{false}
+    benchmark_ready{false},
+    consensus_engine(std::move(engine))
 {
   // Calculate optimal logical stripes based on key_range (hash_table_size)
   // Cap at 4096 to prevent allocating excessive memory for massive key ranges.
