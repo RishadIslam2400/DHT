@@ -16,7 +16,7 @@ std::vector<uint32_t> generate_keys(size_t num_keys) {
 // Concurrent writes (High Contention)
 static void BM_ConcurrentPuts(benchmark::State& state) {
   // Setup a shared table for all threads
-  static TimestampedStripedLockConcurrentHashTable<uint32_t, uint32_t> table(100000, 1024);
+  static TimestampedStripedLockConcurrentHashTable<uint32_t, uint32_t> table(100000, 65536);
   static auto keys = generate_keys(1000000);
   
   uint64_t ts = 1;
@@ -34,7 +34,7 @@ BENCHMARK(BM_ConcurrentPuts)->Threads(1)->Threads(4)->Threads(8)->Threads(16);
 
 // Benchmark: Mixed Read/Write (80% Reads, 20% Writes - Typical DHT workload)
 static void BM_MixedReadWrite(benchmark::State& state) {
-  static TimestampedStripedLockConcurrentHashTable<uint32_t, uint32_t> table(100000, 1024);
+  static TimestampedStripedLockConcurrentHashTable<uint32_t, uint32_t> table(100000, 65536);
   static auto keys = generate_keys(1000000);
   
   // Pre-populate the table

@@ -6,8 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include <ranges>
-#include <mutex>
-#include <shared_mutex>
+#include <bit>
 
 #include "common/xxHash64.h"
 #include "common/dht_common.h"
@@ -21,7 +20,7 @@ struct Ht_item {
 };
 
 struct alignas(64) AlignedLock {
-  RWSpinlock mutex;
+  Spinlock mutex;
 };
 
 template <typename K, typename V>
@@ -56,11 +55,7 @@ private:
 public:
   explicit TimestampedStripedLockConcurrentHashTable(int size, int locks) : count(0) {
     // Force num_locks to the next highest power of 2 for the bitwise AND optimization
-    num_locks = 1;
-    num_locks = 1;
-    while (num_locks < locks) {
-      num_locks <<= 1;
-    }
+    num_locks = std::bit_ceil(static_cast<uint32_t>(locks));
 
     // Ensure capacity is a multiple of locks so lock mapping remains uniform
     if (size % num_locks != 0) {
@@ -78,7 +73,7 @@ public:
     size_t bucket_index = get_bucket_index(raw_hash);
     int lock_index = get_lock_index(bucket_index);
 
-    std::lock_guard<RWSpinlock> lock(table_mutexes[lock_index].mutex);
+    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);
     std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
 
     auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V> &item) {
@@ -108,7 +103,7 @@ public:
     int lock_index = get_lock_index(bucket_index);
 
     // Shared lock allows concurrent readers
-    std::shared_lock<RWSpinlock> lock(table_mutexes[lock_index].mutex);    
+    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);    
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
     auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V> &item) {
@@ -128,7 +123,7 @@ public:
     size_t bucket_index = get_bucket_index(raw_hash);
     int lock_index = get_lock_index(bucket_index);
 
-    std::shared_lock<RWSpinlock> lock(table_mutexes[lock_index].mutex);
+    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
     auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V>& item) {
