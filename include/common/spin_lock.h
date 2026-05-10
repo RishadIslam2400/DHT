@@ -50,3 +50,61 @@ public:
     lock_flag.store(false, std::memory_order_release);
   }
 };
+
+class RWSpinlock {
+private:
+    // 0 = Unlocked
+    // 0xFFFFFFFF = Write-locked
+    // > 0 = Number of active readers
+    std::atomic<uint32_t> state{0};
+
+    static constexpr uint32_t WRITE_LOCKED = 0xFFFFFFFF;
+
+public:
+    // Writer Methods (Exclusive)
+    void lock() {
+      uint32_t expected;
+      while (true) {
+        expected = state.load(std::memory_order_relaxed);
+        if (expected == 0 && state.compare_exchange_weak(expected, WRITE_LOCKED, 
+                                                          std::memory_order_acquire, 
+                                                          std::memory_order_relaxed)) {
+          break;
+        }
+        // Hardware pause to prevent pipeline flushing while spinning
+        #if defined(__x86_64__)
+          __builtin_ia32_pause();
+        #else
+          std::this_thread::yield();
+        #endif
+      }
+    }
+
+    void unlock() {
+      state.store(0, std::memory_order_release);
+    }
+
+    // Reader Methods (Shared)
+    void lock_shared() {
+      uint32_t expected;
+      while (true) {
+        expected = state.load(std::memory_order_relaxed);
+        // If there is no writer, try to atomically increment the reader count
+        if (expected != WRITE_LOCKED && 
+            state.compare_exchange_weak(expected, expected + 1, 
+                                        std::memory_order_acquire, 
+                                        std::memory_order_relaxed)) {
+          break;
+        }
+        #if defined(__x86_64__)
+          __builtin_ia32_pause();
+        #else
+          std::this_thread::yield();
+        #endif
+      }
+    }
+
+    void unlock_shared() {
+      state.fetch_sub(1, std::memory_order_release);
+    }
+};

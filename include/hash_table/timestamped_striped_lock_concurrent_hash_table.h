@@ -19,7 +19,7 @@ struct Ht_item {
 };
 
 struct alignas(64) AlignedLock {
-  Spinlock mutex;
+  RWSpinlock mutex;
 };
 
 template <typename K, typename V>
@@ -76,7 +76,7 @@ public:
     size_t bucket_index = get_bucket_index(raw_hash);
     int lock_index = get_lock_index(bucket_index);
 
-    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);
+    std::lock_guard<RWSpinlock> lock(table_mutexes[lock_index].mutex);
     std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
 
     auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V> &item) {
@@ -106,7 +106,7 @@ public:
     int lock_index = get_lock_index(bucket_index);
 
     // Shared lock allows concurrent readers
-    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);    
+    std::shared_lock<RWSpinlock> lock(table_mutexes[lock_index].mutex);    
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
     auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V> &item) {
@@ -126,7 +126,7 @@ public:
     size_t bucket_index = get_bucket_index(raw_hash);
     int lock_index = get_lock_index(bucket_index);
 
-    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);
+    std::shared_lock<RWSpinlock> lock(table_mutexes[lock_index].mutex);
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
     auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V>& item) {
