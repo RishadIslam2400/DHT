@@ -22,6 +22,13 @@ enum class DhtCommand : uint8_t {
   ExitBarrier = 7   // Exit sync
 };
 
+enum class RpcResult : uint8_t {
+  Success = 0,
+  SendFailed = 1,      // The TCP write failed. The peer never saw it. Safe to retry.
+  RecvFailed = 2,      // The TCP read failed/timed out. Peer might have executed it. Unsafe to retry.
+  InvalidPayload = 3   // Request exceeded size limits.
+};
+
 enum class TwoPhaseCommitCommand : uint8_t {
   Prepare = 0,      // Phase 1: Lock keys and validate
   Commit = 1,       // Phase 2: Apply writes to storage

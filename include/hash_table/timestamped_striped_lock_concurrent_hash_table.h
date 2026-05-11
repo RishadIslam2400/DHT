@@ -19,10 +19,6 @@ struct Ht_item {
   uint64_t timestamp; // Logical clock commit timestamp
 };
 
-struct alignas(64) AlignedLock {
-  Spinlock mutex;
-};
-
 template <typename K, typename V>
 class TimestampedStripedLockConcurrentHashTable {
 private:
@@ -32,7 +28,7 @@ private:
   int capacity;
   
   // Concurrency member variables
-  mutable std::unique_ptr<AlignedLock[]> table_mutexes;
+  mutable std::unique_ptr<AlignedSpinlock[]> table_mutexes;
   int num_locks;
 
   inline uint64_t get_raw_hash(const K& key) const {
@@ -64,7 +60,12 @@ public:
 
     capacity = size;
     table.resize(capacity);
-    table_mutexes = std::make_unique<AlignedLock[]>(num_locks);
+    for (auto& bucket : table) {
+      // Pre-allocate space for 4 collisions.
+      bucket.reserve(4); 
+    }
+
+    table_mutexes = std::make_unique<AlignedSpinlock[]>(num_locks);
   }
 
   // Single PUT operation using Last-Write-Wins
@@ -102,7 +103,6 @@ public:
     size_t bucket_index = get_bucket_index(raw_hash);
     int lock_index = get_lock_index(bucket_index);
 
-    // Shared lock allows concurrent readers
     std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);    
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 

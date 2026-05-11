@@ -51,6 +51,10 @@ public:
   }
 };
 
+struct alignas(64) AlignedSpinlock {
+  Spinlock mutex;
+};
+
 class RWSpinlock {
 private:
     // 0 = Unlocked

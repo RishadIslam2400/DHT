@@ -14,7 +14,7 @@ ConnectionPool::ConnectionPool(int num_nodes) : pools(num_nodes) {}
 
 ConnectionPool::~ConnectionPool() {
   for (TargetPool& target_pool : pools) {
-    std::lock_guard<std::mutex> lock(target_pool.mtx);
+    std::lock_guard<Spinlock> lock(target_pool.pool_mtx.mutex);
     for (int sock : target_pool.sockets) {
       close(sock);
     }
@@ -39,9 +39,9 @@ int ConnectionPool::create_new_connection(const std::string &target_ip, const in
     return -1;
   }
 
-  // struct timeval timeout;
-  // timeout.tv_sec = 120; timeout.tv_usec = 0;
-  // setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  struct timeval timeout;
+  timeout.tv_sec = 300; timeout.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   // setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
   int opt = 1;
@@ -72,8 +72,7 @@ int ConnectionPool::create_new_connection(const std::string &target_ip, const in
 int ConnectionPool::get_connection(const int target_id, const std::string &target_ip, const int target_port) {
   // try to pop from pool
   {
-    std::unique_lock<std::mutex> lock(pools[target_id].mtx);
-
+    std::lock_guard<Spinlock> lock(pools[target_id].pool_mtx.mutex);
     if (!pools[target_id].sockets.empty()) {
       int sock = pools[target_id].sockets.back(); // Get recently used connection
       pools[target_id].sockets.pop_back();
@@ -92,7 +91,7 @@ void ConnectionPool::return_connection(const int target_id, const int sock, cons
     return;
   }
   
-  std::unique_lock<std::mutex> lock(pools[target_id].mtx);
+  std::unique_lock<Spinlock> lock(pools[target_id].pool_mtx.mutex);
   
   // Bounds checking: Prevent File Descriptor Exhaustion
   if (pools[target_id].sockets.size() >= MAX_SOCKETS_PER_NODE) {

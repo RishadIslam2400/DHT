@@ -5,12 +5,14 @@
 #include <queue>
 #include <string>
 
-constexpr int MAX_SOCKETS_PER_NODE = 16;
+#include "common/spin_lock.h"
+
+constexpr int MAX_SOCKETS_PER_NODE = 128;
 
 class ConnectionPool {
 private:
   struct TargetPool {
-    std::mutex mtx;
+    AlignedSpinlock pool_mtx;
     std::vector<int> sockets; // LIFO stack
 
     TargetPool() {

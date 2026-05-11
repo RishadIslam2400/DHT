@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
 
     size_t total_peers = cluster_map.size() - 1;
     size_t num_locks = total_peers * num_threads * 4;
-    StaticClusterDHTNode node(cluster_map, self_config, key_range, num_locks, replication_degree);
+    StaticClusterDHTNode node(cluster_map, self_config, key_range * 2, num_locks, replication_degree);
 
     node.start(); 
     node.warmup_network(num_threads);

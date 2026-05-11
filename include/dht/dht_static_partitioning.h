@@ -41,7 +41,7 @@ private:
   ConnectionPool connection_pool;
 
   // Mechanism for listener thread to gracefully join client threads during shutdown
-  std::mutex thread_mutex;
+  AlignedSpinlock thread_mutex;
   std::vector<std::thread> client_threads;
   std::vector<int> active_sockets;
 
@@ -51,27 +51,13 @@ private:
   std::set<int> barrier_checkins;
   std::atomic<bool> benchmark_ready;
 
-  /// Consensus engine
-  std::unique_ptr<IConsensusEngine> consensus_engine;
-
-  // IStateMachine Implementation: 
-  // Translates committed raw bytes back into HashTable
-  void apply_committed_log(uint64_t commit_index, const uint8_t* data, size_t data_len) override;
-
-  // INetworkTransport Implementation:
-  // Exposes zero-copy sending to the Consensus Engine
-  void send_message(int target_node_id, ProtocolType proto, uint8_t command_type,
-                    const uint8_t* payload, size_t payload_size) override;
-  std::vector<int> get_peer_ids() const override;
-  int get_self_id() const override { return self_config.id; }
-
   /// 2PC Concurrency Control Mechanism (Runs on top of Consensus)
   alignas(64) std::atomic<uint64_t> logical_clock{0};
   size_t num_logical_stripes;
   size_t logical_stripe_mask;
 
   // Dynamically allocated arrays for the logical state
-  std::unique_ptr<Spinlock[]> stripe_locks;
+  std::unique_ptr<AlignedSpinlock[]> stripe_locks;
   std::vector<std::unordered_set<uint32_t>> logically_locked_stripes;
   
   // Holds data payloads that have passed Phase 1 validation but await Phase 2 commit
@@ -79,7 +65,7 @@ private:
     uint64_t tx_timestamp;
     std::vector<std::pair<uint32_t, uint32_t>> batch;
   };
-  std::unique_ptr<Spinlock[]> staging_locks;
+  std::unique_ptr<AlignedSpinlock[]> staging_locks;
   std::vector<std::vector<StagedTx>> staging_stripes;
 
   /// Routing
@@ -122,9 +108,9 @@ private:
   /// Network I/O Primitives
   static bool recv_n_bytes(const int sock, void *buffer, const size_t n);
   // Uses Scatter-Gather (writev) to send a command byte + payload in 1 syscall
-  bool perform_rpc_single_request(const int sock, ProtocolType proto, uint8_t cmd,
-                                  const uint8_t *request, size_t request_size,
-                                  uint8_t *response, size_t response_size);
+  RpcResult perform_rpc_single_request(const int sock, ProtocolType proto, uint8_t cmd,
+                                  const uint8_t *request, const size_t request_size,
+                                  uint8_t *response, const size_t response_size);
   // Wraps RPC in a retry loop using the Connection Pool
   bool send_single_request(const int target_id, const std::string &target_ip,
                            const int target_port, ProtocolType proto, uint8_t cmd,
@@ -165,6 +151,19 @@ private:
   void handle_client(int client_socket);
   void listen_loop();
 
+  /// Consensus engine
+  std::unique_ptr<IConsensusEngine> consensus_engine;
+
+  // Translates committed raw bytes back into HashTable
+  void apply_committed_log(uint64_t commit_index, const uint8_t* data, size_t data_len) override;
+
+  // Exposes zero-copy sending to the Consensus Engine
+  void send_message(int target_node_id, ProtocolType proto, uint8_t command_type,
+                    const uint8_t* payload, size_t payload_size) override;
+
+  std::vector<int> get_peer_ids() const override;
+  int get_self_id() const override { return self_config.id; }
+
 public:
   explicit StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
                                 int hash_table_size, int num_locks, int rep_degree,
@@ -183,11 +182,11 @@ public:
   void wait_for_barrier();
 
   // All-to-all broadcast barrier to prevent early shutdown connection drops
-  std::mutex exit_mtx;
+  AlignedSpinlock exit_mtx;
   std::set<int> exited_peers;
   void wait_for_exit_barrier();
 
   inline uint64_t increment_logical_clock() {
-      return logical_clock.fetch_add(1, std::memory_order_relaxed);
+    return logical_clock.fetch_add(1, std::memory_order_relaxed);
   }
 };
