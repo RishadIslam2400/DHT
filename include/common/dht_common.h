@@ -104,24 +104,39 @@ enum class GetStatus : uint8_t {
 struct GetResponse {
   uint32_t value;      // Only valid if status == Found
   GetStatus status;
-  uint8_t _padding[3];
+  uint8_t _padding[3] = {0};
 
   static GetResponse success(uint32_t v) { return {v, GetStatus::Found, {0}}; }
   static GetResponse not_found()    { return {0, GetStatus::NotFound, {0}}; }
   static GetResponse error()        { return {0, GetStatus::NetworkError, {0}}; }
 };
 
-// Header sent by the Coordinator during 2PC PREPARE Phase
+// Header sent by the Coordinator during 2PC prepare Phase
 struct TxPrepareHeader {
   uint64_t tx_timestamp;
   uint16_t batch_size;   // number of PUT requests
-  uint8_t  _padding[6];  // 6 bytes explicit padding
+  uint8_t  _padding[6] = {0};  // 6 bytes explicit padding
 };
 
-// Header sent by Coordinator during 2PC COMMIT Phase
+// Response sent by cohorts during 2PC prepare Phase
+struct TxPrepareResponse {
+  uint64_t remote_clock;
+  uint8_t vote;
+  uint8_t  _padding[7] = {0};
+};
+
+// Header sent by Coordinator during 2PC COMMIT/ABORT Phase
 // Used to identify which transaction in the server's staging_area to commit or abort.
-struct TxCommandHeader {
+struct TxCommitHeader {
   uint64_t tx_timestamp;
+};
+
+// Handle coordinator crash during phase 2 of 2PC using Raft
+struct alignas(16) CoordinatorCommitIntent {
+  uint64_t tx_timestamp;
+  uint8_t  decision;      // 1 = COMMIT, 0 = ABORT
+  uint8_t  target_shards[3]; // IDs of the cohorts involved (assume max 3)
+  uint16_t num_shards;
 };
 
 // Header sent during CMD_PAXOS_PREPARE
@@ -135,7 +150,7 @@ struct PaxosAcceptHeader {
   uint64_t slot_index;
   uint64_t ballot_number;
   uint16_t batch_size;    // How many PutRequests are inside the LogEntry payload
-  uint8_t  _padding[6];   // 6 bytes padding
+  uint8_t  _padding[6] = {0};   // 6 bytes padding
 };
 
 // Acknowledgment sent back to the leader (CMD_PAXOS_ACCEPTED)
@@ -143,7 +158,7 @@ struct PaxosAcceptedHeader {
   uint64_t slot_index;
   uint64_t ballot_number;
   uint32_t ack_node_id;
-  uint32_t _padding;      // 4 bytes padding
+  uint32_t _padding = 0;      // 4 bytes padding
 };
 
 // Header sent during RaftCommand::RequestVote
@@ -152,14 +167,14 @@ struct RaftRequestVoteHeader {
   uint64_t last_log_index;
   uint64_t last_log_term;
   uint32_t candidate_id;
-  uint32_t _padding;
+  uint32_t _padding = 0;
 };
 
 // Reply to a RequestVote
 struct RaftVoteReplyHeader {
   uint64_t term;
   uint8_t  vote_granted; // 1 for true, 0 for false
-  uint8_t  _padding[7];
+  uint8_t  _padding[7] = {0};
 };
 
 // Header sent during RaftCommand::AppendEntries
@@ -170,7 +185,7 @@ struct RaftAppendEntriesHeader {
   uint64_t leader_commit;
   uint32_t leader_id;
   uint16_t batch_size;
-  uint16_t _padding;
+  uint16_t _padding = 0;
 };
 
 // Reply to an AppendEntries
@@ -178,5 +193,5 @@ struct RaftAppendReplyHeader {
   uint64_t term;
   uint64_t match_index; // If successful, the index the follower appended
   uint8_t  success;     // 1 for true, 0 for false
-  uint8_t  _padding[7];
+  uint8_t  _padding[7] = {0};
 };

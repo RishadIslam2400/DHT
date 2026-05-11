@@ -23,7 +23,11 @@ struct NodeStats {
 
   // Operation latencies
   alignas(64) std::atomic<uint64_t> remote_puts_total_ns{0};
+  alignas(64) std::atomic<uint64_t> remote_gets_total_ns{0};
+  alignas(64) std::atomic<uint64_t> local_tx_prepare_total_ns{0};
   alignas(64) std::atomic<uint64_t> local_tx_commit_total_ns{0};
+  alignas(64) std::atomic<uint64_t> local_tx_abort_total_ns{0};
+  alignas(64) std::atomic<uint64_t> coordinator_tx_total_ns{0};
 
   // Remote Network Metrics
   alignas(64) std::atomic<uint32_t> remote_puts_success{0};

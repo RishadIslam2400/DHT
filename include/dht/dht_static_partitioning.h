@@ -41,9 +41,9 @@ private:
   ConnectionPool connection_pool;
 
   // Mechanism for listener thread to gracefully join client threads during shutdown
-  AlignedSpinlock thread_mutex;
+  std::mutex thread_mutex;
   std::vector<std::thread> client_threads;
-  std::vector<int> active_sockets;
+  std::unordered_set<int> active_sockets;
 
   // Mechanism for distributed barrier
   std::mutex barrier_mtx;
@@ -146,6 +146,21 @@ private:
                        const std::vector<std::pair<uint32_t, uint32_t>> &batch);
   bool send_tx_commit(const int target_id, const uint64_t tx_timestamp);
   bool send_tx_abort(const int target_id, const uint64_t tx_timestamp);
+
+  struct RecoveryTask {
+    int target_id;
+    TwoPhaseCommitCommand cmd;
+    uint64_t tx_timestamp;
+  };
+
+  // Thread-safe queue for stalled Phase 2 messages
+  Spinlock recovery_mtx;
+  std::vector<RecoveryTask> recovery_queue;
+
+  inline void enqueue_for_async_recovery(int target, TwoPhaseCommitCommand command, uint64_t ts) {
+    std::lock_guard<Spinlock> lock(recovery_mtx);
+    recovery_queue.push_back({target, command, ts});
+  }
 
   // Connection acceptance and routing loop
   void handle_client(int client_socket);
