@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <ranges>
 #include <bit>
+#include <numeric>
 
 #include "common/xxHash64.h"
 #include "common/dht_common.h"
@@ -24,7 +25,7 @@ class TimestampedStripedLockConcurrentHashTable {
 private:
   // Storage member variables
   std::vector<std::vector<Ht_item<K, V>>> table;
-  std::atomic<int> count;
+  std::unique_ptr<alignas(64) std::atomic<int>[]> striped_counts;
   int capacity;
   
   // Concurrency member variables
@@ -45,57 +46,138 @@ private:
   }
 
   inline size_t get_bucket_index(uint64_t raw_hash) const {
-    return raw_hash % capacity;
-  }
+  return raw_hash & (capacity - 1);
+}
 
 public:
-  explicit TimestampedStripedLockConcurrentHashTable(int size, int locks) : count(0) {
-    // Force num_locks to the next highest power of 2 for the bitwise AND optimization
-    num_locks = std::bit_ceil(static_cast<uint32_t>(locks));
+  explicit TimestampedStripedLockConcurrentHashTable(int requested_capacity, int requested_locks) {
+    // Force capacity and locks to be powers of two
+    capacity = std::bit_ceil(static_cast<size_t>(std::max(1, requested_capacity)));
+    num_locks = std::bit_ceil(static_cast<size_t>(std::max(1, requested_locks)));
 
-    // Ensure capacity is a multiple of locks so lock mapping remains uniform
-    if (size % num_locks != 0) {
-      size += (num_locks - (size % num_locks));
-    }
-
-    capacity = size;
     table.resize(capacity);
-    for (auto& bucket : table) {
-      // Pre-allocate space for 4 collisions.
-      bucket.reserve(4); 
+    table_mutexes = std::make_unique<AlignedSpinlock[]>(num_locks);
+    striped_counts = std::make_unique<std::atomic<int>[]>(num_locks);
+
+    for (int i = 0; i < num_locks; ++i) {
+      striped_counts[i].store(0, std::memory_order_relaxed);
     }
 
-    table_mutexes = std::make_unique<AlignedSpinlock[]>(num_locks);
+    for (int i = 0; i < capacity; ++i) {
+      table[i].reserve(4); 
+    }
   }
 
-  // Single PUT operation using Last-Write-Wins
+  // Returns the total size
+  int size() const {
+    int total = 0;
+    for (int i = 0; i < num_locks; ++i) {
+      total += striped_counts[i].load(std::memory_order_relaxed);
+    }
+    return total;
+  }
+
+  // Single put operation using Last-Write-Wins
   PutResult put(const K& key, const V& value, const uint64_t incoming_ts) {
     uint64_t raw_hash = get_raw_hash(key);
     size_t bucket_index = get_bucket_index(raw_hash);
-    int lock_index = get_lock_index(bucket_index);
+    int lock_idx = get_lock_index(bucket_index);
 
-    std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);
+    std::lock_guard<Spinlock> lock(table_mutexes[lock_idx].mutex);
+
     std::vector<Ht_item<K, V>>& bucket = table[bucket_index];
-
-    auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V> &item) {
-      return item.key == key;
-    });
-
-    if (it != bucket.end()) {
-      // Reject the write if the physical timestamp is newer (larger is newer).
-      if (incoming_ts > it->timestamp) {
-        it->value = value;
-        it->timestamp = incoming_ts;
-        return PutResult::Updated;
+    for (Ht_item<K, V>& item : bucket) {
+      if (item.key == key) {
+        if (incoming_ts > item.timestamp) [[likely]] {
+          item.value = value;
+          item.timestamp = incoming_ts;
+          return PutResult::Updated;
+        }
+        return PutResult::Dropped; 
       }
-
-      return PutResult::Dropped; // obsolete write dropped (lost updates)
     }
 
     // Key not found, append new entry
     bucket.push_back({key, value, incoming_ts});
-    count.fetch_add(1, std::memory_order_relaxed);
+    striped_counts[lock_idx].fetch_add(1, std::memory_order_relaxed);
     return PutResult::Inserted;
+  }
+
+  // Multi-Put Phase 2 Commit
+  void multi_put(const std::vector<std::pair<K, V>>& kv_pairs, const uint64_t tx_timestamp) {
+    size_t batch_size = kv_pairs.size();
+    if (batch_size == 0) return;
+
+    // Stack allocation for lock deduplication
+    constexpr size_t MAX_BATCH = 64;
+    int lock_indices[MAX_BATCH];
+    size_t actual_batch = std::min(batch_size, MAX_BATCH);
+
+    for (size_t i = 0; i < actual_batch; ++i) {
+      uint64_t raw_hash = get_raw_hash(kv_pairs[i].first);
+      lock_indices[i] = get_lock_index(get_bucket_index(raw_hash));
+    }
+
+    // Sort locks in ascending global order to prevent deadlock
+    std::sort(lock_indices, lock_indices + actual_batch);
+
+    // Deduplicate locks
+    size_t num_unique_locks = 0;
+    for (size_t i = 0; i < actual_batch; ++i) {
+      if (i == 0 || lock_indices[i] != lock_indices[num_unique_locks - 1]) {
+        lock_indices[num_unique_locks++] = lock_indices[i];
+      }
+    }
+
+    // Acquire all unique locks sequentially
+    for (size_t i = 0; i < num_unique_locks; ++i) {
+      table_mutexes[lock_indices[i]].mutex.lock();
+    }
+
+    // Track inserts locally
+    int inserts_per_lock[MAX_BATCH] = {0};
+
+    // Apply writes
+    for (size_t i = 0; i < actual_batch; ++i) {
+      const auto& kv = kv_pairs[i];
+      uint64_t raw_hash = get_raw_hash(kv.first);
+      size_t bucket_index = get_bucket_index(raw_hash);
+      int lock_idx = get_lock_index(bucket_index);
+
+      auto& bucket = table[bucket_index];
+      bool found = false;
+
+      for (auto& item : bucket) {
+        if (item.key == kv.first) {
+          if (tx_timestamp > item.timestamp) [[likely]] {
+            item.value = kv.second;
+            item.timestamp = tx_timestamp;
+          }
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        bucket.push_back({kv.first, kv.second, tx_timestamp});
+        
+        // Find which unique lock this belonged to and tally it
+        for (size_t j = 0; j < num_unique_locks; ++j) {
+          if (lock_indices[j] == lock_idx) {
+            inserts_per_lock[j]++;
+            break;
+          }
+        }
+      }
+    }
+
+    // Update striped counters & release locks
+    for (int i = num_unique_locks - 1; i >= 0; --i) {
+      if (inserts_per_lock[i] > 0) {
+        striped_counts[lock_indices[i]].fetch_add(inserts_per_lock[i], std::memory_order_relaxed);
+      }
+      table_mutexes[lock_indices[i]].mutex.unlock();
+    }
   }
 
   std::optional<V> get(const K& key) const {
@@ -106,11 +188,10 @@ public:
     std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);    
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
-    auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V> &item) {
-      return item.key == key;
-    });
-    if (it != bucket.end()) {
-      return it->value;
+    for (const auto& item : bucket) {
+      if (item.key == key) [[likely]] {
+        return item.value;
+      }
     }
 
     return std::nullopt;
@@ -126,79 +207,14 @@ public:
     std::lock_guard<Spinlock> lock(table_mutexes[lock_index].mutex);
     const std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
 
-    auto it = std::ranges::find_if(bucket, [&key](const Ht_item<K, V>& item) {
-      return item.key == key;
-    });
-
-    if (it != bucket.end()) {
-      return it->timestamp;
+    for (const auto& item : bucket) {
+      if (item.key == key) [[likely]] {
+        return item.timestamp;
+      }
     }
 
     return 0; // 0 indicates the key does not exist yet
   }
 
-  // COMMIT phase of the 2PC protocol.
-  // Applies a single coordinator timestamp atomically across multiple buckets.
-  int multi_put(const std::vector<std::pair<K, V>>& kv_pairs, const uint64_t tx_timestamp) {
-    constexpr size_t MAX_MULTI_PUT_SIZE = 32;
-    int lock_indices[MAX_MULTI_PUT_SIZE];
-    size_t num_unique_locks = 0;
-
-    size_t batch_size = std::min(kv_pairs.size(), MAX_MULTI_PUT_SIZE);
-    for (size_t i = 0; i < batch_size; ++i) {
-      uint64_t raw_hash = get_raw_hash(kv_pairs[i].first);
-      lock_indices[i] = get_lock_index(get_bucket_index(raw_hash));
-    }
-
-    // Sort locks in ascending global order to prevent circular wait deadlock.
-    std::sort(lock_indices, lock_indices + batch_size);
-
-    // Deduplicate locks to prevent the same thread from attempting to acquire same lock multiple times.
-    for (size_t i = 0; i < batch_size; ++i) {
-      if (i == 0 || lock_indices[i] != lock_indices[num_unique_locks - 1]) {
-        lock_indices[num_unique_locks++] = lock_indices[i];
-      }
-    }
-
-    // Acquire all unique locks sequentially
-    for (size_t i = 0; i < num_unique_locks; ++i) {
-      table_mutexes[lock_indices[i]].mutex.lock();
-    }
-
-    int added = 0;
-    for (size_t i = 0; i < batch_size; ++i) {
-      const std::pair<K, V>& kv = kv_pairs[i];
-      uint64_t raw_hash = get_raw_hash(kv.first);
-      size_t bucket_index = get_bucket_index(raw_hash);
-      std::vector<Ht_item<K, V>> &bucket = table[bucket_index];
-
-      auto it = std::ranges::find_if(bucket, [&kv](const Ht_item<K, V>& item) {
-        return item.key == kv.first;
-      });
-
-      if (it != bucket.end()) {
-        if (tx_timestamp > it->timestamp) {
-          it->value = kv.second;
-          it->timestamp = tx_timestamp;
-        }
-      } else {
-        bucket.push_back({kv.first, kv.second, tx_timestamp});
-        added++;
-      }
-    }
-
-    if (added > 0) {
-        count.fetch_add(added, std::memory_order_relaxed);
-    }
-
-    // Release locks in reverse order
-    for (int i = num_unique_locks - 1; i >= 0; --i) {
-      table_mutexes[lock_indices[i]].mutex.unlock();
-    }
-
-    return added;
-  }
-
   int get_capacity() const { return capacity; }
-  int get_count() const { return count.load(); }
 };

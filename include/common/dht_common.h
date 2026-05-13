@@ -32,7 +32,8 @@ enum class RpcResult : uint8_t {
 enum class TwoPhaseCommitCommand : uint8_t {
   Prepare = 0,      // Phase 1: Lock keys and validate
   Commit = 1,       // Phase 2: Apply writes to storage
-  Abort = 2         // Phase 2: Discard staging area writes
+  Abort = 2,        // Phase 2: Discard staging area writes
+  StatusCheck = 3   // Cohort enquires about the status of coordiantor after timeout
 };
 
 enum class PaxosCommand : uint8_t {
@@ -114,8 +115,9 @@ struct GetResponse {
 // Header sent by the Coordinator during 2PC prepare Phase
 struct TxPrepareHeader {
   uint64_t tx_timestamp;
-  uint16_t batch_size;   // number of PUT requests
-  uint8_t  _padding[6] = {0};  // 6 bytes explicit padding
+  uint16_t batch_size;
+  int16_t coordinator_id;
+  uint32_t _padding{0};
 };
 
 // Response sent by cohorts during 2PC prepare Phase

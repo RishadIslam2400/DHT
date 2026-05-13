@@ -13,7 +13,7 @@ private:
   size_t tail = 0;
 
   bool ensure_bytes(size_t n) {
-    // Loop until we have at least 'n' unparsed bytes in local RAM
+    // Loop until we have at least 'n' unparsed bytes
     while (tail - head < n) {
       // If we are out of space at the end of the vector, compact it by 
       // sliding the unparsed partial data down to index 0.
@@ -26,8 +26,7 @@ private:
         tail = remaining;
       }
 
-      // If the requested message 'n' is larger than our entire buffer 
-      // (e.g., a massive CMD_BATCH_PUT), dynamically expand the buffer.
+      // If the requested message 'n' is larger than the buffer then expand
       if (buffer.size() - tail < n - (tail - head)) {
         buffer.resize(std::max(buffer.size() * 2, tail + n));
       }
