@@ -4,6 +4,9 @@
 #include <unordered_map>
 #include <queue>
 #include <string>
+#include <vector>
+#include <atomic>
+#include <memory>
 
 #include "common/spin_lock.h"
 
@@ -22,7 +25,10 @@ private:
 
   std::vector<TargetPool> pools;
 
-  int create_new_connection(const std::string &target_ip, const int target_port);
+  // Lock-free array to track permanently dead nodes
+  std::unique_ptr<std::atomic<bool>[]> dead_nodes;
+
+  int create_new_connection(const int target_id, const std::string &target_ip, const int target_port);
 public:
   explicit ConnectionPool(int num_nodes);
   ~ConnectionPool();
@@ -30,6 +36,5 @@ public:
   int get_connection(const int target_id, const std::string &target_ip, const int target_port);
   void return_connection(const int target_id, const int sock, const bool destroy);
 
-  // Call this before the benchmark starts to establish initial TCP handshakes
   void pre_warm(const int target_id, const std::string &target_ip, const int target_port, const int count);
 };

@@ -37,6 +37,7 @@ add_library(dht_lib
     src/dht/dht_execution.cpp
     src/dht/dht_public_interface.cpp
     src/dht/node_properties.cpp
+    src/dht/raft_engine.cpp
     src/dht/dht_transaction_manager.cpp
     src/network/connection_pool.cpp
 )

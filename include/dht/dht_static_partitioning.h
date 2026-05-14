@@ -17,6 +17,8 @@
 #include "network/connection_pool.h"
 #include "common/spin_lock.h"
 #include "consensus_interface.h"
+#include "raft_engine.h"
+#include "common/threadpool.h"
 
 // Forward declaration of the transaction manager
 class DHTTransactionManager;
@@ -59,6 +61,7 @@ private:
   
   std::vector<NodeConfig> cluster_map;
   NodeConfig self_config;
+  std::vector<int> cached_peer_ids;
   int replication_degree;
   
   TimestampedStripedLockConcurrentHashTable<uint32_t, uint32_t> storage;
@@ -105,7 +108,8 @@ private:
   std::unique_ptr<AlignedSpinlock[]> staging_locks;
   std::vector<std::vector<StagedTx>> staging_stripes;
 
-  AlignedSpinlock recovery_mtx;
+  std::mutex recovery_mtx;
+  std::condition_variable recovery_cv;
   std::vector<RecoveryTask> recovery_queue;
 
   // =========================================================================
@@ -139,12 +143,12 @@ private:
   }
 
   inline void enqueue_for_async_recovery(int target, TwoPhaseCommitCommand command, uint64_t ts) {
-    std::lock_guard<Spinlock> lock(recovery_mtx.mutex);
+    std::lock_guard<std::mutex> lock(recovery_mtx);
     recovery_queue.push_back({target, command, ts});
   }
 
   // =========================================================================
-  // 6. Network Subsystem (Mapped to dht_network.cpp)
+  // Network Subsystem (Mapped to dht_network.cpp)
   // =========================================================================
   
   void listen_loop();
@@ -152,18 +156,21 @@ private:
   void recovery_dispatcher_loop();
 
   static bool recv_n_bytes(const int sock, void *buffer, const size_t n);
-  
-  RpcResult perform_rpc_single_request(const int sock, ProtocolType proto, uint8_t cmd,
-                                       const uint8_t *request, const size_t request_size,
-                                       uint8_t *response, const size_t response_size);
+
+  void perform_rpc_fire_and_forget(
+    int sock, ProtocolType proto, uint8_t cmd, const uint8_t *payload, size_t size
+  );
+
+  RpcResult perform_rpc_single_request(
+    const int sock, ProtocolType proto, uint8_t cmd, const uint8_t *request,
+    const size_t request_size, uint8_t *response, const size_t response_size
+  );
                                        
-  bool send_single_request(const int target_id, const std::string &target_ip,
-                           const int target_port, ProtocolType proto, uint8_t cmd,
-                           const uint8_t *request, size_t request_size,
-                           uint8_t *response, size_t response_size);
-                           
-  bool send_batch(const int target_id, const std::string &target_ip, const int target_port,
-                  const std::vector<PutRequest> &batch_requests, TelemetryBatcher& batcher);
+  bool send_single_request(
+    const int target_id, const std::string &target_ip, const int target_port,
+    ProtocolType proto, uint8_t cmd, const uint8_t *request, size_t request_size,
+    uint8_t *response, size_t response_size
+  );
 
   // =========================================================================
   // Storage & 2PC Execution (Mapped to dht_execution.cpp)
@@ -173,8 +180,9 @@ private:
   void stale_lock_sweeper_loop();
 
   // Storage Engine operations
-  PutResult put_local(const uint32_t key, const uint32_t value, const uint64_t timestamp, TelemetryBatcher& batcher);
-  std::optional<uint32_t> get_local(const uint32_t key, TelemetryBatcher& batcher) const;
+  PutResult put_local(const uint32_t key, const uint32_t value, const uint64_t timestamp,
+                      TelemetryBatcher& batcher);
+  std::optional<LocalValue> get_local(const uint32_t key, TelemetryBatcher& batcher) const;
   
   PutResult put_remote(const uint32_t key, const uint32_t value, const uint64_t timestamp,
                        const NodeConfig &target, TelemetryBatcher& batcher);
@@ -213,9 +221,10 @@ public:
   // Public API (Mapped to dht_public_interface.cpp)
   // =========================================================================
   
-  explicit StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
-                                int hash_table_size, int num_locks, int rep_degree,
-                                std::unique_ptr<IConsensusEngine> engine);
+  explicit StaticClusterDHTNode(
+    std::vector<NodeConfig> map, NodeConfig self, size_t hash_table_size, size_t num_locks,
+    int rep_deg
+  );
   ~StaticClusterDHTNode();
 
   // Connect the transaction manager post-construction
@@ -224,6 +233,7 @@ public:
   }
 
   // Lifecycle
+  ThreadPool thread_pool;
   void start();
   void stop();
   void warmup_network(int connections_per_peer);
@@ -236,7 +246,19 @@ public:
   mutable NodeStats stats;
   void print_status();
 
-  inline uint64_t increment_logical_clock() {
-    return logical_clock.fetch_add(1, std::memory_order_relaxed);
+  // Generates a strictly monotonic Hybrid Logical Clock (HLC) timestamp.
+  // Guarantees causality while staying attached to physical wall-time.
+  inline uint64_t generate_hlc_timestamp() {
+    uint64_t wall_time = std::chrono::time_point_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now()).time_since_epoch().count();
+    uint64_t current_clock = logical_clock.load(std::memory_order_relaxed);
+    uint64_t next_clock;
+
+    do {
+      // The new timestamp must be strictly greater than the current logical clock 
+      // and it should catch up to the wall clock if we are behind.
+      next_clock = std::max(wall_time, current_clock + 1);
+    } while (!logical_clock.compare_exchange_weak(current_clock, next_clock, std::memory_order_relaxed));
+    
+    return next_clock;
   }
 };

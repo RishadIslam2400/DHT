@@ -23,7 +23,7 @@ ConnectionPool::~ConnectionPool() {
 }
 
 // Create a new connection with the target node
-int ConnectionPool::create_new_connection(const std::string &target_ip, const int target_port) {
+int ConnectionPool::create_new_connection(const int target_id, const std::string &target_ip, const int target_port) {
   sockaddr_in node_addr;
   memset(&node_addr, 0, sizeof(node_addr));
   node_addr.sin_family = AF_INET;
@@ -39,49 +39,61 @@ int ConnectionPool::create_new_connection(const std::string &target_ip, const in
     return -1;
   }
 
+  // 500ms max block time for Read AND Send
   struct timeval timeout;
-  timeout.tv_sec = 300; timeout.tv_usec = 0;
+  timeout.tv_sec = 0; 
+  timeout.tv_usec = 500000; 
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  // setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
   int opt = 1;
   setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
   // Bounded Retry Loop for connection establishment
-  int max_retries = 5;
+  int max_retries = 3;
   for (int attempts = 0; attempts < max_retries; ++attempts) {
     if (connect(sock, (struct sockaddr *)&node_addr, sizeof(node_addr)) == 0) {
       return sock;
     }
     
-    // If it's a hard error (not a busy refusal), stop trying
     if (errno != ECONNREFUSED && errno != EAGAIN && errno != ETIMEDOUT) {
       break;
     }
     
-    // Sleep to give the target node's CPU time to clear its `accept()` backlog
     std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1 << attempts)));
   }
 
-  log_error("Connection failure after retries", errno);
+  // If we exhaust retries or get a hard failure, the node is permanently dead.
+  // Mark it in the lock-free array
+  #ifndef NDEBUG
+    std::cerr << "[ConnectionPool] Node " << target_id << " is unresponsive. Blacklisting permanently.\n";
+  #endif
+  
+  dead_nodes[target_id].store(true, std::memory_order_relaxed);
+  
   close(sock);
   return -1;
 }
 
-// Check if the queue has an idle socket. If yes, pop it. If no, create a new one.
+// Check if the queue has an idle socket. Fast-fail if the node is dead.
 int ConnectionPool::get_connection(const int target_id, const std::string &target_ip, const int target_port) {
+  // If the node is marked dead, reject instantly
+  if (dead_nodes[target_id].load(std::memory_order_relaxed)) [[unlikely]] {
+    return -1; 
+  }
+
   // try to pop from pool
   {
     std::lock_guard<Spinlock> lock(pools[target_id].pool_mtx.mutex);
     if (!pools[target_id].sockets.empty()) {
-      int sock = pools[target_id].sockets.back(); // Get recently used connection
+      int sock = pools[target_id].sockets.back(); 
       pools[target_id].sockets.pop_back();
       return sock;
     }
   }
 
-  // Pool empty or target queue empty, create new connection
-  return create_new_connection(target_ip, target_port);
+  // Pool empty, create new connection
+  return create_new_connection(target_id, target_ip, target_port);
 }
 
 // Return socket to pool for reuse or destroy if broken
@@ -102,26 +114,27 @@ void ConnectionPool::return_connection(const int target_id, const int sock, cons
   }
 }
 
-void ConnectionPool::pre_warm(const int target_id, const std::string &target_ip, const int target_port, const int count) {
+void ConnectionPool::pre_warm(const int target_id, const std::string &target_ip, const int target_port, const int count) {  
   std::vector<int> temp_sockets;
   temp_sockets.reserve(count);
 
   bool logged_waiting = false;
 
-  // Actively poll until the exact number of connections are established
   while (temp_sockets.size() < static_cast<size_t>(count)) {
-    int sock = create_new_connection(target_ip, target_port);
+    int sock = create_new_connection(target_id, target_ip, target_port); 
     
     if (sock != -1) {
       temp_sockets.push_back(sock);
     } else {
-      // Only log the warning once to avoid spamming the console
       if (!logged_waiting) {
         std::cout << "[ConnectionPool] Waiting for Node " << target_id 
                   << " (" << target_ip << ":" << target_port << ") to come online...\n";
         logged_waiting = true;
       }
-      // Sleep briefly to avoid blasting the network with SYN packets
+      
+      // If pre-warm fails, un-blacklist it so we keep trying to boot the cluster
+      dead_nodes[target_id].store(false, std::memory_order_relaxed);
+      
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }
@@ -130,7 +143,6 @@ void ConnectionPool::pre_warm(const int target_id, const std::string &target_ip,
     std::cout << "[ConnectionPool] Node " << target_id << " is online. Connections established.\n";
   }
 
-  // Return all successfully established hot sockets to the LIFO stack
   for (int sock : temp_sockets) {
     return_connection(target_id, sock, false);
   }

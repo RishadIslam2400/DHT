@@ -104,34 +104,39 @@ public:
   }
 
   // Multi-Put Phase 2 Commit
-  void multi_put(const std::vector<std::pair<K, V>>& kv_pairs, const uint64_t tx_timestamp) {
-    size_t batch_size = kv_pairs.size();
+  void multi_put(const std::pair<K, V>* items, size_t batch_size, const uint64_t tx_timestamp) {
     if (batch_size == 0) return;
 
     // Stack allocation for lock deduplication
     constexpr size_t MAX_BATCH = 64;
-    int lock_indices[MAX_BATCH];
     size_t actual_batch = std::min(batch_size, MAX_BATCH);
 
+    int lock_indices[MAX_BATCH];
+    size_t bucket_indices[MAX_BATCH];
+
+    // Compute hashes and map to locks
     for (size_t i = 0; i < actual_batch; ++i) {
-      uint64_t raw_hash = get_raw_hash(kv_pairs[i].first);
-      lock_indices[i] = get_lock_index(get_bucket_index(raw_hash));
+      uint64_t raw_hash = get_raw_hash(items[i].first);
+      bucket_indices[i] = get_bucket_index(raw_hash);
+      lock_indices[i] = get_lock_index(bucket_indices[i]);
     }
 
     // Sort locks in ascending global order to prevent deadlock
-    std::sort(lock_indices, lock_indices + actual_batch);
+    int sorted_locks[MAX_BATCH];
+    std::copy(lock_indices, lock_indices + actual_batch, sorted_locks);
+    std::sort(sorted_locks, sorted_locks + actual_batch);
 
     // Deduplicate locks
     size_t num_unique_locks = 0;
     for (size_t i = 0; i < actual_batch; ++i) {
-      if (i == 0 || lock_indices[i] != lock_indices[num_unique_locks - 1]) {
-        lock_indices[num_unique_locks++] = lock_indices[i];
+      if (i == 0 || sorted_locks[i] != sorted_locks[num_unique_locks - 1]) {
+        sorted_locks[num_unique_locks++] = sorted_locks[i];
       }
     }
 
     // Acquire all unique locks sequentially
     for (size_t i = 0; i < num_unique_locks; ++i) {
-      table_mutexes[lock_indices[i]].mutex.lock();
+      table_mutexes[sorted_locks[i]].mutex.lock();
     }
 
     // Track inserts locally
@@ -139,18 +144,17 @@ public:
 
     // Apply writes
     for (size_t i = 0; i < actual_batch; ++i) {
-      const auto& kv = kv_pairs[i];
-      uint64_t raw_hash = get_raw_hash(kv.first);
-      size_t bucket_index = get_bucket_index(raw_hash);
-      int lock_idx = get_lock_index(bucket_index);
+      const auto& item_pair = items[i];
+      size_t bucket_index = bucket_indices[i];
+      int lock_idx = lock_indices[i];
 
       auto& bucket = table[bucket_index];
       bool found = false;
 
       for (auto& item : bucket) {
-        if (item.key == kv.first) {
+        if (item.key == item_pair.first) {
           if (tx_timestamp > item.timestamp) [[likely]] {
-            item.value = kv.second;
+            item.value = item_pair.second;
             item.timestamp = tx_timestamp;
           }
           found = true;
@@ -159,11 +163,11 @@ public:
       }
 
       if (!found) {
-        bucket.push_back({kv.first, kv.second, tx_timestamp});
+        bucket.push_back({item_pair.first, item_pair.second, tx_timestamp});
         
         // Find which unique lock this belonged to and tally it
         for (size_t j = 0; j < num_unique_locks; ++j) {
-          if (lock_indices[j] == lock_idx) {
+          if (sorted_locks[j] == lock_idx) {
             inserts_per_lock[j]++;
             break;
           }
@@ -172,15 +176,15 @@ public:
     }
 
     // Update striped counters & release locks
-    for (int i = num_unique_locks - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(num_unique_locks) - 1; i >= 0; --i) {
       if (inserts_per_lock[i] > 0) {
-        striped_counts[lock_indices[i]].fetch_add(inserts_per_lock[i], std::memory_order_relaxed);
+        striped_counts[sorted_locks[i]].fetch_add(inserts_per_lock[i], std::memory_order_relaxed);
       }
-      table_mutexes[lock_indices[i]].mutex.unlock();
+      table_mutexes[sorted_locks[i]].mutex.unlock();
     }
   }
 
-  std::optional<V> get(const K& key) const {
+  std::optional<LocalValue> get(const K& key) const {
     uint64_t raw_hash = get_raw_hash(key);
     size_t bucket_index = get_bucket_index(raw_hash);
     int lock_index = get_lock_index(bucket_index);
@@ -190,7 +194,10 @@ public:
 
     for (const auto& item : bucket) {
       if (item.key == key) [[likely]] {
-        return item.value;
+        return LocalValue{
+          item.value, 
+          item.timestamp
+        };
       }
     }
 

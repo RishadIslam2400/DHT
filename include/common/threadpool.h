@@ -6,6 +6,9 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <future>
+#include <memory>
+#include <stdexcept>
 
 class ThreadPool {
 public:
@@ -29,16 +32,28 @@ public:
   }
 
   // Add a new work item to the pool
-  template<typename F>
-  void submit_task(F&& func) {
-    // acquire lock before changing the condition
+  template<class F, class... Args>
+  auto submit_task(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
+    using return_type = std::invoke_result_t<F, Args...>;
+
+    // Wrap the function in a packaged_task so it can generate a future
+    auto task = std::make_shared<std::packaged_task<return_type()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+    );
+
+    std::future<return_type> res = task->get_future();
     {
-      std::lock_guard<std::mutex> lock(m);
-      tasks.emplace(std::forward<F>(func));
+        std::lock_guard<std::mutex> lock(m);
+        if (stop) {
+            throw std::runtime_error("submit_task on stopped ThreadPool");
+        }
+        
+        // Push a void lambda into the queue that executes the packaged task
+        tasks.emplace([task]() { (*task)(); });
     }
-    // call notify_one after release the lock; this will prevent the waiting thread
-    // from immediate block after wake up
+    
     cv.notify_one();
+    return res;
   }
 
 private:

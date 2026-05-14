@@ -85,13 +85,30 @@ void StaticClusterDHTNode::listen_loop() {
     }
 
     #ifdef __linux__
-    // Disable Delayed ACKs
-    if (setsockopt(new_socket, IPPROTO_TCP, TCP_QUICKACK, &opt, sizeof(opt)) < 0) {
-      log_error("Enabling TCP_QUICKACK failed: ", errno);
-    }
+      // Disable Delayed ACKs
+      if (setsockopt(new_socket, IPPROTO_TCP, TCP_QUICKACK, &opt, sizeof(opt)) < 0) {
+        log_error("Enabling TCP_QUICKACK failed: ", errno);
+      }
     #endif
 
-    // Expand OS Buffers to handle massive BatchPuts and Raft AppendEntries
+    // Enable Aggressive TCP Keepalives
+    int keepalive = 1;
+    if (setsockopt(new_socket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
+      log_error("Enabling SO_KEEPALIVE failed: ", errno);
+    }
+
+    #ifdef __linux__
+      // Customize the keepalive thresholds (Default Linux is 2 hours! We want 8 seconds total)
+      int idle = 5;       // Start sending probes after 5 seconds of total silence
+      int interval = 1;   // Send a new probe every 1 second
+      int maxpkt = 3;     // If 3 probes drop in a row, the peer is dead. Close the socket.
+
+      setsockopt(new_socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+      setsockopt(new_socket, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+      setsockopt(new_socket, IPPROTO_TCP, TCP_KEEPCNT, &maxpkt, sizeof(maxpkt));
+    #endif
+
+    // Expand OS Buffers to handle massive AppendEntries
     int buf_size = 1024 * 1024 * 2; // 2 Megabytes
     setsockopt(new_socket, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
     setsockopt(new_socket, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
@@ -144,13 +161,11 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
   // Pre-allocate required buffers
   std::vector<std::pair<uint32_t, uint32_t>> tx_batch;
   tx_batch.reserve(BATCH_SIZE);
-  std::vector<uint8_t> consensus_payload;
-  consensus_payload.reserve(65536); // Max network payload is uint16_t
   std::vector<uint8_t> response_buffer;
   response_buffer.reserve(BATCH_SIZE);
 
   // Instantiate a telemetry batcher for this thread
-  TelemetryBatcher batcher;
+  TelemetryBatcher batcher{};
   batcher.stats = &this->stats;
 
   while (running.load(std::memory_order_relaxed)) {
@@ -165,7 +180,7 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       break; // EOF or connection dropped
     }
 
-    NetworkEnvelope env;
+    NetworkEnvelope env{};
     std::memcpy(&env, env_ptr, sizeof(NetworkEnvelope));
 
     // Read the payload
@@ -189,55 +204,57 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
         }
 
         switch (cmd) {
-          case DhtCommand::Put:
-          case DhtCommand::BatchPut: {
-            // Route strictly through Consensus.
-            if (!consensus_engine || consensus_engine->get_role() != ConsensusRole::LEADER) {
-              // Only the Leader can accept writes
-              PutResult result = PutResult::Failed;
-              if (send(client_socket, &result, 1, MSG_NOSIGNAL) != 1) [[unlikely]]
+          case DhtCommand::Put: {
+            if (env.payload_size == 0 || (env.payload_size % sizeof(PutRequest) != 0)) [[unlikely]] {
                 goto cleanup;
-              break;
             }
 
-            size_t consensus_payload_size = 1 + env.payload_size;
-            consensus_payload.resize(consensus_payload_size);
-            consensus_payload[0] = static_cast<uint8_t>(cmd); 
+            size_t batch_count = env.payload_size / sizeof(PutRequest);
+            std::vector<std::pair<uint32_t, uint32_t>> client_kv_pairs;
+            client_kv_pairs.reserve(batch_count);
+
+            for (size_t i = 0; i < batch_count; ++i) {
+              PutRequest req;
+              std::memcpy(&req, payload_ptr + (i * sizeof(PutRequest)), sizeof(PutRequest));
+              client_kv_pairs.push_back({req.key, req.value});
+            }
+
+            // Delegate to the transaction manager
+            TransactionResult result = TransactionResult::Aborted;
+            if (tx_manager) [[likely]] {
+               result = tx_manager->execute_transaction(client_kv_pairs);
+            }
+
+            // Respond to the follower node
+            uint8_t final_status = static_cast<uint8_t>(
+                result == TransactionResult::Committed ? PutResult::Inserted : PutResult::Failed
+            );
             
-            if (env.payload_size > 0) {
-              std::memcpy(consensus_payload.data() + 1, payload_ptr, env.payload_size);
-            }
-
-            // Block until consensus safely replicates this to a majority of followers
-            bool committed = consensus_engine->propose_command(consensus_payload.data(), consensus_payload_size);
-
-            // Respond to the client
-            if (cmd == DhtCommand::Put) {
-              PutResult result = committed ? PutResult::Inserted : PutResult::Failed;
-              if (send(client_socket, &result, 1, MSG_NOSIGNAL) != 1) [[unlikely]]
-                goto cleanup;
-            } else {
-              // BatchPut expects an array of 1-byte responses
-              uint16_t batch_count = env.payload_size / sizeof(PutRequest);
-              uint8_t final_status = static_cast<uint8_t>(committed ? PutResult::Inserted : PutResult::Failed);
-              response_buffer.assign(batch_count, final_status);
-              
-              if (send(client_socket, response_buffer.data(), batch_count, MSG_NOSIGNAL) != batch_count) [[unlikely]]
+            response_buffer.assign(batch_count, final_status);
+            if (send(client_socket, response_buffer.data(), batch_count, MSG_NOSIGNAL) != batch_count) [[unlikely]] {
                 goto cleanup;
             }
             break;
           }
 
           case DhtCommand::Get: {
-            const GetRequest* req = reinterpret_cast<const GetRequest*>(payload_ptr);
-            synchronize_clock(req->timestamp);
+            GetRequest req{};
+            std::memcpy(&req, payload_ptr, sizeof(GetRequest));
+            synchronize_clock(req.timestamp);
 
-            std::optional<uint32_t> res = get_local(req->key, batcher);
-            GetResponse response = res.has_value() ? GetResponse::success(res.value())
-                                                   : GetResponse::not_found();
+            // Read from local storage
+            auto res = get_local(req.key, batcher);
+            
+            GetResponse response{};
+            if (res.has_value()) {
+              response = GetResponse::success(res.value().value, res.value().timestamp);
+            } else {
+              response = GetResponse::not_found(0);
+            }
 
             if (send(client_socket, &response, sizeof(GetResponse), MSG_NOSIGNAL) != sizeof(GetResponse)) [[unlikely]]
               goto cleanup;
+
             break;
           }
 
@@ -288,24 +305,29 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
         switch (cmd) {
           case TwoPhaseCommitCommand::Prepare: {
-            const TxPrepareHeader* header = reinterpret_cast<const TxPrepareHeader*>(payload_ptr);
-            synchronize_clock(header->tx_timestamp);
+            TxPrepareHeader header{};
+            std::memcpy(&header, payload_ptr, sizeof(TxPrepareHeader));
+            synchronize_clock(header.tx_timestamp);
 
-            size_t expected_payload = sizeof(TxPrepareHeader) + (header->batch_size * 8);
+            size_t expected_payload = sizeof(TxPrepareHeader) + (header.batch_size * 8);
             if (env.payload_size < expected_payload) [[unlikely]] {
               log_error("Corrupted PREPARE packet: Payload too small", 0);
               goto cleanup;
             }
 
-            const std::pair<uint32_t, uint32_t>* batch_data = reinterpret_cast<const std::pair<uint32_t, uint32_t>*>(payload_ptr + sizeof(TxPrepareHeader));
-            tx_batch.assign(batch_data, batch_data + header->batch_size);
+            tx_batch.clear();
+            for (size_t i = 0; i < header.batch_size; ++i) {
+                uint32_t k, v;
+                std::memcpy(&k, payload_ptr + sizeof(TxPrepareHeader) + (i * 8), 4);
+                std::memcpy(&v, payload_ptr + sizeof(TxPrepareHeader) + (i * 8) + 4, 4);
+                tx_batch.push_back({k, v});
+            }
 
-            bool prepared = local_tx_prepare(header->tx_timestamp, header->coordinator_id, tx_batch, batcher);
+            bool prepared = local_tx_prepare(header.tx_timestamp, header.coordinator_id, tx_batch, batcher);
 
-            TxPrepareResponse response = {
-              .remote_clock = logical_clock.load(std::memory_order_relaxed),
-              .vote = static_cast<uint8_t>(prepared ? 1 : 0)
-            };
+            TxPrepareResponse response{};
+            response.remote_clock = logical_clock.load(std::memory_order_relaxed);
+            response.vote = static_cast<uint8_t>(prepared ? 1 : 0);
 
             if (send(client_socket, &response, sizeof(TxPrepareResponse), MSG_NOSIGNAL) != sizeof(TxPrepareResponse)) [[unlikely]]
               goto cleanup;
@@ -313,33 +335,28 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
           }
 
           case TwoPhaseCommitCommand::Commit:
-          case TwoPhaseCommitCommand::Abort: {
-            const TxCommitHeader* header = reinterpret_cast<const TxCommitHeader*>(payload_ptr);
-            synchronize_clock(header->tx_timestamp);
-
-            if (cmd == TwoPhaseCommitCommand::Commit) {
-              local_tx_commit(header->tx_timestamp, batcher);
-            } else {
-              local_tx_abort(header->tx_timestamp, batcher);
-            }
-
-            uint8_t ack = 1;
-            if (send(client_socket, &ack, 1, MSG_NOSIGNAL) != 1) [[unlikely]]
-              goto cleanup;
-            break;
-          }
-
+          case TwoPhaseCommitCommand::Abort:
           case TwoPhaseCommitCommand::StatusCheck: {
-            const TxCommitHeader* header = reinterpret_cast<const TxCommitHeader*>(payload_ptr);
-            
-            bool is_committed = false;
-            if (tx_manager != nullptr) [[likely]] {
-              is_committed = tx_manager->is_transaction_committed(header->tx_timestamp);
+            TxCommitHeader header{};
+            std::memcpy(&header, payload_ptr, sizeof(TxCommitHeader));
+
+            if (cmd == TwoPhaseCommitCommand::StatusCheck) {
+              bool is_committed = false;
+              if (tx_manager != nullptr) [[likely]] {
+                is_committed = tx_manager->is_transaction_committed(header.tx_timestamp);
+              }
+              uint8_t response = is_committed ? 1 : 0;
+              if (send(client_socket, &response, 1, MSG_NOSIGNAL) != 1) [[unlikely]] goto cleanup;
+            } else {
+              synchronize_clock(header.tx_timestamp);
+              if (cmd == TwoPhaseCommitCommand::Commit) {
+                local_tx_commit(header.tx_timestamp, batcher);
+              } else {
+                local_tx_abort(header.tx_timestamp, batcher);
+              }
+              uint8_t ack = 1;
+              if (send(client_socket, &ack, 1, MSG_NOSIGNAL) != 1) [[unlikely]] goto cleanup;
             }
-            
-            uint8_t response = is_committed ? 1 : 0;
-            if (send(client_socket, &response, 1, MSG_NOSIGNAL) != 1) [[unlikely]]
-              goto cleanup;
             break;
           }
         }
@@ -369,6 +386,65 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
       std::lock_guard<std::mutex> lock(thread_mutex);
       active_sockets.erase(client_socket);
     }
+}
+
+// Background recovery thread
+void StaticClusterDHTNode::recovery_dispatcher_loop() {
+  // Allocate buffers with minimal capacity
+  std::vector<RecoveryTask> tasks_to_process;
+  tasks_to_process.reserve(32);
+
+  std::vector<std::future<void>> dispatch_futures;
+  dispatch_futures.reserve(32);
+
+  while (running.load(std::memory_order_relaxed)) {
+    {
+      std::unique_lock<std::mutex> lock(recovery_mtx);
+      recovery_cv.wait_for(lock, std::chrono::milliseconds(500), [this]() {
+        return !running.load(std::memory_order_relaxed) || !recovery_queue.empty();
+      });
+
+      if (!running.load(std::memory_order_relaxed)) {
+        break; 
+      }
+
+      if (recovery_queue.empty()) {
+        continue; 
+      }
+
+      tasks_to_process.swap(recovery_queue);
+    }
+
+    // Check the leader
+    if (!consensus_engine || consensus_engine->get_role() != ConsensusRole::LEADER) {
+      tasks_to_process.clear();
+      continue;
+    }
+
+    // Process the Phase 2 intents asynchronously
+    for (const auto& task : tasks_to_process) {
+      dispatch_futures.push_back(
+        this->thread_pool.submit_task([this, task]() {
+          TelemetryBatcher local_batcher;
+          local_batcher.stats = &this->stats;
+
+          if (task.cmd == TwoPhaseCommitCommand::Commit) {
+            this->send_tx_commit(task.target_id, task.tx_timestamp, local_batcher);
+          } else {
+            this->send_tx_abort(task.target_id, task.tx_timestamp, local_batcher);
+          }
+        })
+      );
+    }
+ 
+    for (auto& fut : dispatch_futures) {
+      fut.get();
+    }
+
+    // Clear local buffers for the next iteration
+    tasks_to_process.clear();
+    dispatch_futures.clear();
+  }
 }
 
 bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size_t n) {
@@ -402,13 +478,40 @@ bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size
   return true;
 }
 
+void StaticClusterDHTNode::perform_rpc_fire_and_forget(
+  int sock, ProtocolType proto, uint8_t cmd, const uint8_t* payload, size_t size
+) {
+    NetworkEnvelope env{};
+    env.protocol_type = proto;
+    env.command_type = cmd;
+    env.payload_size = static_cast<uint16_t>(size);
+    env.sender_id = self_config.id;
+
+    struct iovec iov[2];
+    iov[0].iov_base = &env;
+    iov[0].iov_len = sizeof(NetworkEnvelope);
+    
+    int iovcnt = 1;
+    if (size > 0 && payload != nullptr) {
+        iov[1].iov_base = const_cast<uint8_t*>(payload);
+        iov[1].iov_len = size;
+        iovcnt = 2;
+    }
+
+    struct msghdr msg = {0};
+    msg.msg_iov = iov;
+    msg.msg_iovlen = iovcnt;
+
+    // MSG_DONTWAIT prevents the thread from blocking if TCP buffer is full
+    // MSG_NOSIGNAL prevents crashing if the peer disconnected
+    sendmsg(sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+}
+
 // Scatter-Gather I/O execution
-RpcResult StaticClusterDHTNode::perform_rpc_single_request(const int sock, ProtocolType proto,
-                                                           uint8_t cmd, const uint8_t *request,
-                                                           const size_t request_size, 
-                                                           uint8_t *response,
-                                                           const size_t response_size)
-{
+RpcResult StaticClusterDHTNode::perform_rpc_single_request(
+  const int sock, ProtocolType proto, uint8_t cmd, const uint8_t *request,
+  const size_t request_size, uint8_t *response, const size_t response_size
+) {
   static_assert(BATCH_SIZE * sizeof(PutRequest) <= std::numeric_limits<uint16_t>::max(), 
               "BATCH_SIZE exceeds maximum TCP payload capacity");
 
@@ -486,13 +589,11 @@ RpcResult StaticClusterDHTNode::perform_rpc_single_request(const int sock, Proto
 
 // Wraps the RPC in a bounded retry loop, managing socket checkout and return 
 // against the Thread-Safe Connection Pool
-bool StaticClusterDHTNode::send_single_request(const int target_id,
-                                               const std::string &target_ip,
-                                               const int target_port, ProtocolType proto,
-                                               uint8_t cmd, const uint8_t *request,
-                                               size_t request_size, uint8_t *response,
-                                               size_t response_size)
-{
+bool StaticClusterDHTNode::send_single_request(
+  const int target_id, const std::string &target_ip, const int target_port,
+  ProtocolType proto, uint8_t cmd, const uint8_t *request, size_t request_size,
+  uint8_t *response, size_t response_size
+) {
   const int max_attempts = 2;
 
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
@@ -522,54 +623,5 @@ bool StaticClusterDHTNode::send_single_request(const int target_id,
     // result == RpcResult::SendFailed, safe to retry
   }
 
-  return false;
-}
-
-bool StaticClusterDHTNode::send_batch(const int target_id,
-                                      const std::string& target_ip,
-                                      const int target_port,
-                                      const std::vector<PutRequest>& batch_requests,
-                                      TelemetryBatcher& batcher)
-{
-  size_t batch_size = batch_requests.size();
-  if (batch_size == 0 || batch_size > BATCH_SIZE) [[unlikely]] {
-    return false;
-  }
-
-  uint8_t recv_buffer[BATCH_SIZE];
-  size_t payload_size = batch_size * sizeof(PutRequest);
-
-  auto start_time = std::chrono::high_resolution_clock::now();
-
-  bool success = send_single_request(target_id, target_ip, target_port, 
-                                     ProtocolType::ClientDht, 
-                                     static_cast<uint8_t>(DhtCommand::BatchPut),
-                                     reinterpret_cast<const uint8_t*>(batch_requests.data()),
-                                     payload_size, recv_buffer, batch_size);
-
-  auto end_time = std::chrono::high_resolution_clock::now();
-  uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-  batcher.remote_put_ns += duration_ns;
-
-  if (success) {
-    // Maps Enum bytes to a binary success count (e.g., 0=Fail, 1=Insert, 2=Update, 3=Dropped)
-    static constexpr uint8_t is_success_map[4] = {0, 1, 1, 0};
-    uint32_t successful_puts = 0;
-
-    for (size_t i = 0; i < batch_size; ++i) {
-      // Clamp the byte to 0-3.
-      successful_puts += is_success_map[recv_buffer[i] & 0x03];
-    }
-
-    uint32_t failed_puts = batch_size - successful_puts;
-
-    batcher.remote_put_success += successful_puts;
-    batcher.remote_put_failed += failed_puts;
-
-    return true;
-  }
-
-  // Record hard network failures
-  batcher.remote_put_failed += batch_size;
   return false;
 }

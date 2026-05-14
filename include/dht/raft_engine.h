@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <shared_mutex>
+#include <mutex>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -22,11 +23,21 @@ private:
   INetworkTransport *transport;
   IStateMachine *state_machine;
 
+  // Cached Topology
+  std::vector<int> peer_ids;
+  int total_nodes{0};
+  int quorum_size{0};
+
+  // Global State Lock
   mutable std::shared_mutex raft_mutex;
 
   // Memory pool for log
   std::vector<RaftLogEntry> log;
   std::vector<uint8_t> log_mempool;
+
+  // ====================================================================
+  // RAFT STATE
+  // ====================================================================
 
   // Persistent state on all servers
   uint64_t current_term{0};
@@ -42,26 +53,36 @@ private:
   std::vector<uint64_t> next_index;
   std::vector<uint64_t> match_index;
 
-  // Concurrency
+  // Volatile state on Candidates
+  int votes_received{0};
+
+  // ====================================================================
+  // CONCURRENCY
+  // ====================================================================
   std::atomic<bool> running{false};
 
-  // Handles Leader Election and Heartbeats
+  // Timer Thread (Leader Election & Heartbeats)
   std::thread timer_thread;
   std::condition_variable timer_cv;
-  std::chrono::steady_clock::time_point last_heartbeat_recieved;
+  std::mutex timer_mutex; // Required for timer_cv
+  std::chrono::steady_clock::time_point last_heartbeat_received;
 
-  // Background applier thread
-  // Wakes up when commit_index > last_applied and executes the Hash Table writes
+  // Applier Thread (Pushes committed logs to the Hash Table)
   std::thread applier_thread;
   std::condition_variable apply_cv;
   std::mutex apply_mutex;
+
+  // Commit Awaiter (Blocks propose_command until quorum is reached)
+  std::condition_variable commit_cv;
 
   // Configuration
   int election_timeout_min_ms{150};
   int election_timeout_max_ms{300};
   int heartbeat_interval_ms{50};
   
-  // Handlers
+  // ====================================================================
+  // INTERNAL HANDLERS
+  // ====================================================================
   void timer_loop();
   void applier_loop();
   void start_election();
@@ -79,14 +100,16 @@ private:
   void truncate_log(size_t new_size);
 
 public:
-  explicit RaftEngine(INetworkTransport *transport_layer);
+  explicit RaftEngine(IStateMachine* sm, INetworkTransport* nt);
   ~RaftEngine() override;
 
   // IConsensusEngine interface
-  void start(IStateMachine* state_machine) override;
+  void start() override;
   void stop() override;
 
+  // Blocks calling thread until quorum replication or leadership loss
   bool propose_command(const uint8_t* data, size_t data_len) override;
+  
   void on_network_message(uint32_t sender_id, uint8_t command_type, 
                           const uint8_t* payload, uint16_t payload_size) override;
 

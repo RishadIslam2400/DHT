@@ -3,10 +3,15 @@
 
 #include <random>
 #include <iomanip>
+#include <chrono>
+#include <iostream>
+#include <vector>
+#include <thread>
 
 // Global Metrics
 std::atomic<uint64_t> total_latency_ns{0};
 std::atomic<uint64_t> total_ops_completed{0};
+std::atomic<uint64_t> client_side_aborts{0};
 
 // Synchronization primitives for the barrier
 std::atomic<int> threads_ready_count{0};
@@ -75,7 +80,7 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
           }
         } while (is_duplicate);
 
-        op.key[k] = key_dist(rng);
+        op.key[k] = candidate_key;
         op.val[k] = val_dist(rng);
       }
 
@@ -89,7 +94,7 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
   }
 
   // Signal this thread is ready
-  threads_ready_count++;
+  threads_ready_count.fetch_add(1, std::memory_order_relaxed);
   while(!start_benchmark_flag.load(std::memory_order_acquire)) {
     #if defined(__x86_64__)
       __builtin_ia32_pause();
@@ -98,33 +103,36 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
     #endif
   }
 
-  uint64_t local_latency_ns = 0;
   auto* ops_ptr = operations.data();
   size_t n_ops = operations.size();
   DHTTransactionManager batcher(*node);
+
+  std::vector<std::pair<uint32_t, uint32_t>> tx_batch;
+  tx_batch.reserve(3);
+
+  uint64_t local_aborts = 0;
 
   auto start = std::chrono::high_resolution_clock::now();
   for (size_t i = 0; i < n_ops; ++i) {
     const OpData &op = ops_ptr[i];
 
     if (op.type == OpType::GET) {
-      batcher.get_sync(op.key[0]);
-    } 
-    else if (op.type == OpType::PUT) {
-      batcher.put_sync(op.key[0], op.val[0]);
-    } 
-    else {
-      // Strip padded dummy keys from the batch execution if key_range < 3
-      int num_unique = std::min(3, key_range);
-      std::vector<std::pair<uint32_t, uint32_t>> batch(num_unique);
-      
+      auto result = batcher.get_sync(op.key[0]);
+    } else {
+      tx_batch.clear(); // O(1) clear, resets size but keeps capacity
+      int num_unique = (op.type == OpType::PUT) ? 1 : std::min(3, key_range);
+
       for (int k = 0; k < num_unique; ++k) {
-        batch[k] = {op.key[k], op.val[k]};
+        tx_batch.push_back({op.key[k], op.val[k]});
       }
-      batcher.multi_put(batch);
+
+      TransactionResult result = batcher.execute_transaction(tx_batch);
+
+      if (result != TransactionResult::Committed) {
+        local_aborts++;
+      }
     }
   }
-  // batcher.flush_all();
 
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -132,12 +140,13 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
   thread_end_times[thread_id] = end;
   total_latency_ns.fetch_add(duration, std::memory_order_relaxed);
   total_ops_completed.fetch_add(n_ops, std::memory_order_relaxed);
+  client_side_aborts.fetch_add(local_aborts, std::memory_order_relaxed);
 }
 
 int main(int argc, char** argv) {
   if (argc < 7) {
-      std::cerr << "Usage: " << argv[0] << " <config_file> <node_id> <num_ops> <num_threads> <key_range> <replication_degree>\n";
-      return 1;
+    std::cerr << "Usage: " << argv[0] << " <config_file> <node_id> <num_ops> <num_threads> <key_range> <replication_degree>\n";
+    return 1;
   }
 
   std::string config_file = argv[1];
@@ -171,6 +180,8 @@ int main(int argc, char** argv) {
 
     size_t total_peers = cluster_map.size() - 1;
     size_t num_locks = total_peers * num_threads * 4;
+
+    // Pass nullptr for the IConsensusEngine
     StaticClusterDHTNode node(cluster_map, self_config, key_range * 2, num_locks, replication_degree);
 
     node.start(); 
@@ -192,7 +203,7 @@ int main(int argc, char** argv) {
 
     // Wait for all local threads to finish memory allocation and PRNG generation
     while(threads_ready_count.load() < num_threads) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     #ifndef NDEBUG
@@ -203,39 +214,40 @@ int main(int argc, char** argv) {
     start_benchmark_flag.store(true, std::memory_order_release);
 
     for (auto& t : workers) {
-        t.join();
+      t.join();
     }
 
     // find the latest end time among all threads
     auto latest_end = global_start;
     for (const auto& t_end : thread_end_times) {
-        if (t_end > latest_end) {
-            latest_end = t_end;
-        }
+      if (t_end > latest_end) {
+        latest_end = t_end;
+      }
     }
 
+    std::cout << "\n[TestApp] Local benchmark complete. Waiting for all peers at exit barrier..." << std::endl;
+    node.wait_for_exit_barrier();
+
+    std::cout << "[TestApp] Exit barrier cleared. Stopping node..." << std::endl;
+    node.stop();
+
+    // Metrics calculation
     std::chrono::duration<double> total_wall_time = latest_end- global_start;
 
-    // Aggregate Storage & Server-Side Metrics
-    uint64_t storage_puts = node.stats.local_puts_inserted.load()
-                          + node.stats.local_puts_updated.load()
-                          + node.stats.local_puts_dropped.load();
-    uint64_t storage_gets = node.stats.local_gets_found.load()
-                          + node.stats.local_gets_not_found.load();
-    uint64_t total_storage_ops = storage_puts + storage_gets;
+    // Calculate IOPS
+    uint64_t total_storage_ops = node.stats.local_puts_inserted.load()
+                               + node.stats.local_puts_updated.load()
+                               + node.stats.local_puts_dropped.load()
+                               + node.stats.local_gets_found.load()
+                               + node.stats.local_gets_not_found.load();
 
     // Goodput Volume: Only count successful operations
-    uint64_t successful_storage_ops = node.stats.local_puts_inserted.load()
-                                    + node.stats.local_puts_updated.load()
-                                    + node.stats.local_gets_found.load()
-                                    + node.stats.local_gets_not_found.load();
+    uint64_t goodput_ops = node.stats.local_puts_inserted.load()
+                         + node.stats.local_puts_updated.load()
+                         + node.stats.local_gets_found.load();
    
-    // Cohort Contention: How often this server had to reject a remote 2PC request
-    uint64_t cohort_rejections = node.stats.tx_prepare_rejected_locked.load() 
-                               + node.stats.tx_prepare_rejected_obsolete.load();
-
     double storage_iops = total_storage_ops / total_wall_time.count();
-    double server_goodput_iops = successful_storage_ops / total_wall_time.count();
+    double server_goodput_iops = goodput_ops / total_wall_time.count();
 
     // Aggregate Client Metrics
     uint64_t ops_generated = total_ops_completed.load();
@@ -243,6 +255,10 @@ int main(int argc, char** argv) {
 
     double avg_latency_ns = static_cast<double>(total_latency_ns.load()) / ops_generated;
     double avg_latency_us = avg_latency_ns / 1000.0;
+    
+    uint64_t app_aborts = client_side_aborts.load();
+
+    node.print_status();
 
     // Aggregate Network & Coordinator Metrics
     uint64_t failed_network_puts = node.stats.remote_puts_failed.load();
@@ -258,32 +274,16 @@ int main(int argc, char** argv) {
     std::cout << "Benchmark RESULTS (Node " << node_id << ")\n";
     node.print_status(); 
 
-    std::cout << "Client Experience (Logical Layer)\n";
-    std::cout << "  Total Transactions:       " << ops_generated << "\n";
-    std::cout << "  Client Throughput:        " << std::fixed << std::setprecision(2) << client_tps << " tx/sec\n";
-    std::cout << "  Average Latency:          " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
-    std::cout << "  Total Wall Time:          " << std::fixed << std::setprecision(4) << total_wall_time.count() << " s\n\n";
+    std::cout << "[Benchmark Macro Performance]\n";
+    std::cout << "  Total Wall Time:          " << std::fixed << std::setprecision(4) << total_wall_time.count() << " s\n";
+    std::cout << "  Total Client Operations:  " << ops_generated << "\n";
+    std::cout << "  Client-Side Aborts:       " << app_aborts << " (Rejected by Gateway/Elections)\n";
+    std::cout << "  Client Throughput (TPS):  " << std::fixed << std::setprecision(2) << client_tps << " tx/sec\n";
+    std::cout << "  Average TX Latency:       " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
+    std::cout << "  Storage Throughput:       " << std::fixed << std::setprecision(2) << storage_iops << " IOPS\n";
+    std::cout << "  Server Goodput:           " << std::fixed << std::setprecision(2) << server_goodput_iops << " IOPS\n\n";
 
-    std::cout << "Server & Storage Health (Physical Layer)\n";
-    std::cout << "  Physical KV Operations:   " << total_storage_ops << " ops (Total)\n";
-    std::cout << "  Successful KV Operations: " << successful_storage_ops << " ops (Goodput Volume)\n";
-    std::cout << "  Storage IOPS:             " << std::fixed << std::setprecision(2) << storage_iops << " ops/sec\n";
-    std::cout << "  Server Goodput:           " << std::fixed << std::setprecision(2) << server_goodput_iops << " ops/sec\n";
-    std::cout << "  Cohort Lock Rejections:   " << cohort_rejections << " (Contention)\n\n";
-
-    std::cout << "Distributed Coordinator (2PC Network)\n";
-    std::cout << "  2PC TX Committed:          " << tx_committed << "\n";
-    std::cout << "  2PC TX Aborted:           " << tx_aborted << "\n";
-    std::cout << "  2PC Retry/Abort Rate:     " << std::fixed << std::setprecision(2) << abort_rate << "%\n";
-    std::cout << "  Total Network Drops:      " << total_network_failures << " packets\n\n";
-
-    std::cout << "\n[TestApp] Benchmark complete. Waiting for all peers at exit barrier..." << std::endl;
-    
-    node.wait_for_exit_barrier();
-    
-    std::cout << "[TestApp] Exit barrier cleared. Safe to shutdown." << std::endl;
-
-    node.stop();
+    std::cout << "[TestApp] Shutdown complete." << std::endl;
 
   } catch (const std::exception& e) {
       std::cerr << "[Fatal Error] " << e.what() << std::endl;

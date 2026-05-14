@@ -1,341 +1,228 @@
 #include "dht/dht_transaction_manager.h"
-#include <algorithm>
-#include <thread>
+#include "dht/dht_static_partitioning.h"
+#include "common/xxHash64.h"
+
 #include <iostream>
+#include <algorithm>
+#include <cstring>
+#include <future>
 
-// Buffer Management (Async Path)
-// Flushes a single node's buffer over the network.
-// Relies on the internal retry of send_batch() to handle stale sockets.
-// If the node is completely unreachable, it fails fast to prevent blocking the worker thread.
-void DHTTransactionManager::flush_node(NodeBatch& node_batch) {
-  #ifndef NDEBUG
-    if (node_batch.requests.empty())
-      return;
-  #endif
+DHTTransactionManager::DHTTransactionManager(StaticClusterDHTNode &node)
+    : dht_node(node) {}
 
-  size_t count = node_batch.requests.size();
+void DHTTransactionManager::record_transaction_decision(uint64_t tx_timestamp, bool is_commit) {
+  std::lock_guard<Spinlock> lock(registry_mutex.mutex);
+  transaction_registry[tx_timestamp] = is_commit;
+}
 
-  // Transmit the entire vector payload in a single TCP syscall
-  bool success = dht_node.send_batch(node_batch.id, node_batch.ip, node_batch.port, node_batch.requests);
-
-  if (success) [[likely]] {
-    dht_node.stats.remote_puts_success.fetch_add(count, std::memory_order_relaxed);
-  } else {
-    dht_node.stats.remote_puts_failed.fetch_add(count, std::memory_order_relaxed);
-
-    #ifndef NDEBUG
-    std::cerr << "[Batcher] WARNING: Dropping batch for Node " << node_batch.id 
-              << " after send_batch() retries failed. Node may be offline.\n";
-    #endif
+bool DHTTransactionManager::is_transaction_committed(uint64_t tx_timestamp) const {
+  std::lock_guard<Spinlock> lock(registry_mutex.mutex);
+  auto it = transaction_registry.find(tx_timestamp);
+  
+  if (it != transaction_registry.end()) [[likely]] {
+    return it->second;
   }
   
-  // Clear the buffer after a successful send or a failure
-  node_batch.requests.clear();
+  // If we have no memory of this transaction, default to false (Abort).
+  // This is safe: if a transaction isn't in the log, it never committed.
+  return false; 
 }
 
-// Forces all pending async writes
-void DHTTransactionManager::flush_all() {
-  for (size_t i = 0; i < dht_node.cluster_map.size(); ++i) {
-    flush_node(buffers[i]);
-  }
-}
+// Client API
+TransactionResult DHTTransactionManager::execute_transaction(const std::vector<std::pair<uint32_t, uint32_t>>& kv_pairs) {
+  if (kv_pairs.empty()) [[unlikely]]
+    return TransactionResult::Committed;
 
-DHTTransactionManager::DHTTransactionManager(StaticClusterDHTNode &node) : dht_node(node) {
-  buffers.resize(node.cluster_map.size());
+  // Reroute to the leader if this node is a follower
+  if (!dht_node.consensus_engine || dht_node.consensus_engine->get_role() != ConsensusRole::LEADER) {
+    int leader_id = dht_node.consensus_engine ? dht_node.consensus_engine->get_leader_id() : -1;
 
-  // Initialize the routing info
-  for (size_t i = 0; i < buffers.size(); ++i) {
-    buffers[i].id = node.cluster_map[i].id;
-    buffers[i].ip = node.cluster_map[i].ip;
-    buffers[i].port = node.cluster_map[i].port;
-  }
-}
+    if (leader_id == -1 || leader_id == dht_node.self_config.id || leader_id >= static_cast<int>(dht_node.cluster_map.size())) {
+      return TransactionResult::Aborted; // Cluster is electing a new leader
+    }
 
-// Eventual Consistency Implementation
-void DHTTransactionManager::put_async(const uint32_t& key, const uint32_t& value) {
-  uint64_t async_ts = dht_node.increment_logical_clock();
-  auto replicas = dht_node.get_replica_nodes(key);
-
-  // Broadcast the async put to all replicas
-  for (int i = 0; i < dht_node.replication_degree; ++i) {
-    int target_id = replicas.node_ids[i];
+    // Forward the request to the leader
+    const NodeConfig &leader_node = dht_node.cluster_map[leader_id];
+    int proxy_sock = dht_node.connection_pool.get_connection(leader_node.id, leader_node.ip, leader_node.port);
+    if (proxy_sock < 0)
+      return TransactionResult::Aborted;
     
-    // Write directly to local storage if this node is a replica
-    if (target_id == dht_node.self_config.id) {
-      dht_node.put_local(key, value, async_ts);
-    } else {
-      // Defer TCP transmission by appending to the node buffer
-      NodeBatch &node_batch = buffers[target_id];
-      node_batch.requests.emplace_back(key, value, async_ts);
+    // Serialize the payload
+    std::vector<PutRequest> req_buffer(kv_pairs.size());
+    for (size_t i = 0; i < kv_pairs.size(); ++i) {
+      // Leader will generate the timestamp
+      req_buffer[i] = PutRequest(kv_pairs[i].first, kv_pairs[i].second, 0);
+    }
 
-      // Flush the node buffer if it reaches the batch size
-      if (node_batch.requests.size() >= BATCH_SIZE) {
-        flush_node(node_batch);
-        node_batch.last_flush_time = std::chrono::steady_clock::now(); 
-      }
+    std::vector<uint8_t> proxy_response(kv_pairs.size());
+    RpcResult proxy_status = dht_node.perform_rpc_single_request(
+      proxy_sock, ProtocolType::ClientDht, static_cast<uint8_t>(DhtCommand::Put), 
+      reinterpret_cast<const uint8_t*>(req_buffer.data()), req_buffer.size() * sizeof(PutRequest), 
+      proxy_response.data(), proxy_response.size()
+    );
+
+    dht_node.connection_pool.return_connection(leader_node.id, proxy_sock, proxy_status != RpcResult::Success);
+
+    // If the Leader successfully committed, it returns PutResult::Inserted.
+    return (proxy_status == RpcResult::Success && proxy_response[0] == static_cast<uint8_t>(PutResult::Inserted)) 
+           ? TransactionResult::Committed : TransactionResult::Aborted;
+  }
+
+  // This node is the current leader
+  // Perform the operation with consensus protocol
+  uint64_t tx_ts = dht_node.generate_hlc_timestamp();
+
+  std::unordered_map<int, std::vector<std::pair<uint32_t, uint32_t>>> cohort_batches;
+  for (const auto& kv : kv_pairs) {
+    auto replicas = dht_node.get_replica_nodes(kv.first);
+    for (int i = 0; i < dht_node.replication_degree; ++i) {
+      cohort_batches[replicas.node_ids[i]].push_back(kv);
     }
   }
 
-  // Periodic timeout check to ensure low-volume buffers don't stall forever
-  static thread_local uint32_t time_check_counter = 0;
-  if ((++time_check_counter & 15) == 0) {
-    auto now = std::chrono::steady_clock::now();
-    
-    // Scan all buffers and flush if not empty
-    for (NodeBatch& nb : buffers) {
-      if (nb.id != dht_node.self_config.id && !nb.requests.empty()) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - nb.last_flush_time).count();
+  if (cohort_batches.size() > 6) [[unlikely]] {
+    return TransactionResult::Aborted; // Exceeds packed struct size
+  }
 
-        if (elapsed >= FLUSH_TIMEOUT_MS) {
-          flush_node(nb);
-          nb.last_flush_time = now;
+  CoordinatorCommitIntent intent{};
+  intent.tx_timestamp = tx_ts;
+  intent.num_shards = 0;
+  for (const auto& [cohort_id, _] : cohort_batches) {
+    intent.target_shards[intent.num_shards++] = static_cast<uint8_t>(cohort_id);
+  }
+
+  // Quorum 2PC phase 1: PREPARE
+  std::unordered_map<uint32_t, int> successful_prepares_per_key;
+  AlignedSpinlock tally_mutex;
+  std::vector<std::future<void>> prepare_futures;
+  prepare_futures.reserve(8);
+
+  for (const auto& [cohort_id, batch] : cohort_batches) {
+    // Launch each network call asynchronously
+    prepare_futures.push_back(dht_node.thread_pool.submit_task( 
+      [&, cohort_id = cohort_id, batch = batch]() {
+        TelemetryBatcher local_batcher;
+        local_batcher.stats = &dht_node.stats;
+        bool vote_yes = false;
+
+        if (cohort_id == dht_node.self_config.id) {
+          vote_yes = dht_node.local_tx_prepare(tx_ts, dht_node.self_config.id, batch, local_batcher);
+        } else {
+          vote_yes = dht_node.send_tx_prepare(cohort_id, tx_ts, batch, local_batcher);
+        }
+
+        // Safely tally the votes as they arrive
+        if (vote_yes) {
+          std::lock_guard<Spinlock> lock(tally_mutex.mutex);
+          for (const auto& kv : batch) {
+             successful_prepares_per_key[kv.first]++;
+          }
         }
       }
-    }
-  }
-}
-
-GetResponse DHTTransactionManager::get_async(const uint32_t& key) {
-  uint64_t read_ts = dht_node.increment_logical_clock();
-  auto replicas = dht_node.get_replica_nodes(key);
-
-  // If the current node is a replica, read directly from local storage
-  for (int i = 0; i < dht_node.replication_degree; ++i) {
-    if (replicas.node_ids[i] == dht_node.self_config.id) {
-      std::optional<uint32_t> res = dht_node.get_local(key);
-      if (res.has_value()) {
-        return GetResponse::success(res.value());
-      }
-
-      // Local replica might be behind
-      break;
-    }
+    ));
   }
 
-  // Distribute the remote fallback evenly
-  static thread_local uint32_t rr_counter = 0;
-  int target_index = (rr_counter++) % dht_node.replication_degree;
-  int target_id = replicas.node_ids[target_index];
-
-  // Check the un-flushed async buffers
-  const std::vector<PutRequest> &requests = buffers[target_id].requests;
-
-  // Iterate in reverse to find the most recent write
-  for (auto rev_it = requests.rbegin(); rev_it != requests.rend(); ++rev_it) {
-    if (rev_it->key == key) {
-      return GetResponse::success(rev_it->value);
-    }
+  // Wait for all async calls to finish or timeout
+  for (auto& fut : prepare_futures) {
+    fut.get(); 
   }
 
-  // Execute remote read operation
-  const NodeConfig& target = dht_node.cluster_map[target_id];
-  return dht_node.get_remote(key, read_ts, target);
-}
-
-// Strict Linearizability Implementation
-
-PutResult DHTTransactionManager::put_sync(const uint32_t &key, const uint32_t &value) {
-  if (dht_node.replication_degree == 1) {
-    uint64_t sync_ts = dht_node.increment_logical_clock();
-    const NodeConfig& target = dht_node.get_target_node(key);
-
-    if (target.id == dht_node.self_config.id) {
-      return dht_node.put_local(key, value, sync_ts);
-    } else {
-      return dht_node.put_remote(key, value, sync_ts, target);
-    }
-  }
+  // Verify quorum
+  bool phase1_success = true;
+  int required_quorum = (dht_node.replication_degree / 2) + 1;
   
-  // Execute simple put as multi put
-  std::vector<std::pair<uint32_t, uint32_t>> batch;
-  batch.reserve(1);
-  batch.emplace_back(key, value);
-  bool success = multi_put(batch);
+  for (const auto& kv : kv_pairs) {
+    if (successful_prepares_per_key[kv.first] < required_quorum) {
+      phase1_success = false;
+      break; 
+    }
+  }
+
+  // Phase 2: Commit/Abort through Log Replication
+  if (phase1_success && dht_node.consensus_engine && dht_node.consensus_engine->get_role() == ConsensusRole::LEADER) {
+    intent.decision = 1;
+    uint8_t payload_buffer[sizeof(CoordinatorCommitIntent) + 1];
+    payload_buffer[0] = static_cast<uint8_t>(TwoPhaseCommitCommand::Commit);
+    std::memcpy(payload_buffer + 1, &intent, sizeof(CoordinatorCommitIntent));
+
+    bool success = dht_node.consensus_engine->propose_command(payload_buffer, sizeof(payload_buffer));
+    
+    if (success) {
+      // The commands will be applied asynchronously
+      return TransactionResult::Committed;
+    }
+  }
+
+  // Phase 1 failed, or Consensus failed, or lost leadership in the during this operation
+  // Bypass consensus and instruct all shards to release logical locks
+  intent.decision = 0;
+  record_transaction_decision(tx_ts, false);
   
-  return success ? PutResult::Inserted : PutResult::Failed;
+  for (int i = 0; i < intent.num_shards; ++i) {
+    dht_node.enqueue_for_async_recovery(intent.target_shards[i], TwoPhaseCommitCommand::Abort, tx_ts);
+  }
+
+  return TransactionResult::Aborted;
 }
 
 GetResponse DHTTransactionManager::get_sync(const uint32_t& key) {
-  uint64_t read_ts = dht_node.increment_logical_clock();
-
-  if (dht_node.replication_degree == 1) {
-    const NodeConfig& target = dht_node.get_target_node(key);
-
-    if (target.id == dht_node.self_config.id) {
-      std::optional<uint32_t> res = dht_node.get_local(key);
-      if (res.has_value()) {
-        return GetResponse::success(res.value());
-      }
-
-      return GetResponse::not_found();
-    }
-
-    return dht_node.get_remote(key, read_ts, target);
-  }
-
-  // For replication_degree > 1
+  // Get the Primary and all Backup nodes for this key
   auto replicas = dht_node.get_replica_nodes(key);
+  int required_quorum = (dht_node.replication_degree / 2) + 1;
 
-  // Check if this node holds a replica for this key
-  // Because writes are atomic 2PC, any local replica is guaranteed to be consistent
+  std::vector<std::future<GetResponse>> read_futures;
+  read_futures.reserve(4);
+
+  // Issue all reads simultaneously
   for (int i = 0; i < dht_node.replication_degree; ++i) {
-    if (replicas.node_ids[i] == dht_node.self_config.id) {
-      std::optional<uint32_t> res = dht_node.get_local(key);
-      if (res.has_value()) {
-        return GetResponse::success(res.value());
+    int target_id = replicas.node_ids[i];
+    
+    read_futures.push_back(dht_node.thread_pool.submit_task([&, target_id]() {
+      // Thread-Local Batcher
+      TelemetryBatcher local_batcher;
+      local_batcher.stats = &dht_node.stats;
+
+      if (target_id == dht_node.self_config.id) {
+        auto res = dht_node.get_local(key, local_batcher); 
+        if (res.has_value()) {
+          return GetResponse::success(res.value().value, res.value().timestamp);
+        }
+        return GetResponse::not_found(0);
+      } else {
+        const NodeConfig& target = dht_node.cluster_map[target_id];
+        return dht_node.get_remote(key, 0, target, local_batcher);
       }
-      return GetResponse::not_found();
+    }));
+  }
+
+  int successful_reads = 0;
+  uint64_t highest_ts = 0;
+  std::optional<uint32_t> best_value = std::nullopt;
+
+  // Process responses as futures complete
+  for (auto& fut : read_futures) {
+    GetResponse response = fut.get();
+    
+    if (response.status != GetStatus::NetworkError) [[likely]] {
+      successful_reads++;
+      
+      // Resolve Last-Write-Wins
+      if (response.timestamp >= highest_ts) {
+        highest_ts = response.timestamp;
+        if (response.status == GetStatus::Found) {
+          best_value = response.value;
+        } else {
+          best_value = std::nullopt; 
+        }
+      }
     }
   }
 
-  /* // Because writes are atomic 2PC, it is always safe to read from the first replica.
-  int target_id = replicas.node_ids[0];
-  const NodeConfig& target = dht_node.cluster_map[target_id]; */
- 
-  // Distribute remote reads evenly across all replicas
-  // Use a thread-local counter to round-robin the requests
-  static thread_local uint32_t rr_counter = 0;
-  
-  int target_index = (rr_counter++) % dht_node.replication_degree;
-  int target_id = replicas.node_ids[target_index];
+  if (successful_reads >= required_quorum) {
+    return best_value.has_value() ? GetResponse::success(best_value.value(), highest_ts) 
+                                  : GetResponse::not_found(highest_ts);
+  }
 
-  const NodeConfig& target = dht_node.cluster_map[target_id];
-  return dht_node.get_remote(key, read_ts, target);
+  // If the loop finishes and ALL replicas returned NetworkError, the quorum is dead.
+  return GetResponse::error();
 }
-
-// Two-Phase Commit (2PC) protocol for atomic multi-Key transactions
-bool DHTTransactionManager::multi_put(const std::vector<std::pair<uint32_t, uint32_t>> &kv_pairs) {
-  int attempt = 0;
-
-  // Pre-allocate tracking vectors
-  size_t num_nodes = dht_node.cluster_map.size();
-  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> cohorts(num_nodes);
-  std::vector<int> active_cohort_ids;
-  active_cohort_ids.reserve(num_nodes); // max unique nodes equal to num nodes
-  std::vector<int> prepared_cohorts;
-  prepared_cohorts.reserve(num_nodes);
-
-  // Partition keys by destination nodes and fix active cohorts
-  for (const auto& kv : kv_pairs) {
-    auto replicas = dht_node.get_replica_nodes(kv.first);
-
-    // Add the key to every replica's batch
-    for (int i = 0; i < dht_node.replication_degree; ++i) {
-      int target_id = replicas.node_ids[i];
-
-      // Extract unique target IDs to keep track of active cohorts
-      if (cohorts[target_id].empty()) {
-        active_cohort_ids.push_back(target_id);
-      }
-      cohorts[target_id].push_back(kv);
-    }
-  }
-
-  // Sort IDs so the local node is evaluated first. If the local lock acquisition fails,
-  // the transaction aborts instantly
-  int local_id = dht_node.self_config.id;
-  std::sort(active_cohort_ids.begin(), active_cohort_ids.end(), [local_id](int a, int b) {
-    if (a == local_id) return true;
-    if (b == local_id) return false;
-    return a < b; 
-  });
-
-  // Optimistic concurrency control retry loop
-  while (attempt < MAX_RETRIES) {
-    attempt++;
-
-    // Generate a strictly newer Lamport timestamp to force LWW progress
-    uint64_t tx_timestamp = dht_node.increment_logical_clock();
-    prepared_cohorts.clear();
-    bool abort_required = false;
-
-    // Phase 1: PREPARE
-    // Request exclusive logical locks and validate Last-Write-Wins timestamps
-    for (int target_id : active_cohort_ids) {
-      const auto &batch = cohorts[target_id];
-      bool prepared = false;
-
-      if (target_id == dht_node.self_config.id) {
-        prepared = dht_node.local_tx_prepare(tx_timestamp, batch);
-      } else {
-        prepared = dht_node.send_tx_prepare(target_id, tx_timestamp, batch);
-      }
-
-      if (prepared) {
-        prepared_cohorts.push_back(target_id);
-      } else {
-        abort_required = true;
-        break; // Stop preparing immediately on first rejection
-      }
-    }
-
-    // Lambda for bounded phase 2 delivery guarantee
-    auto enforce_phase2 = [&](int target_id, bool is_commit) {
-      // Perform local commit/abort
-      if (target_id == dht_node.self_config.id) {
-        if (is_commit) {
-          dht_node.local_tx_commit(tx_timestamp);
-        } else {
-          dht_node.local_tx_abort(tx_timestamp);
-        }
-        return;
-      }
-      
-      // Bounded retry loop guarantees the target node receives the command and 
-      // safely releases its locks, preventing permanent distributed deadlocks.
-      int delivery_attempts = 0;
-      bool delivered = false;
-      while (delivery_attempts < 100 && !delivered) {
-        if (is_commit) {
-          delivered = dht_node.send_tx_commit(target_id, tx_timestamp);
-        } else {
-          delivered = dht_node.send_tx_abort(target_id, tx_timestamp);
-        }
-        
-        if (!delivered) {
-          delivery_attempts++;
-          dht_node.stats.coordinator_phase2_retries.fetch_add(1, std::memory_order_relaxed);
-          int sleep_ms = std::min(10 * delivery_attempts, 500);
-          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-        }
-      }
-      if (!delivered) {
-        std::cerr << "[Coordinator] CRITICAL: Phase 2 delivery failed for Node " << target_id << ". Locks orphaned.\n";
-        // Graceful termination 
-        // Handle by increasing delivery attempts
-        throw std::runtime_error("Fatal 2PC Error: Phase 2 Delivery Failed. Cluster state compromised.");
-      }
-    };
-
-    // Phase 2: COMMIT or ABORT
-    if (abort_required) {
-      // Rollback the locks that successfully prepared
-      for (int target_id : prepared_cohorts) {
-        enforce_phase2(target_id, false);
-      }
-
-      dht_node.stats.coordinator_tx_retries.fetch_add(1, std::memory_order_relaxed);
-      
-      // Apply Exponential Backoff WITH JITTER to prevent Dueling Coordinator livelocks
-      static thread_local std::mt19937 generator(std::random_device{}());
-      int base_backoff = 10 * (1 << std::min(attempt, 10));
-      
-      // Randomize the sleep time between 50% and 100% of the backoff
-      std::uniform_int_distribution<int> jitter(base_backoff / 2, base_backoff);
-      std::this_thread::sleep_for(std::chrono::microseconds(jitter(generator)));
-
-      continue; 
-    } else {
-      // All nodes voted yes, Execute the atomic write.
-      for (int target_id : active_cohort_ids) {
-        enforce_phase2(target_id, true);
-      }
-
-      dht_node.stats.coordinator_tx_committed.fetch_add(1, std::memory_order_relaxed);
-      return true; // Transaction completely succeeded
-    }
-  }
-
-  dht_node.stats.coordinator_tx_failed.fetch_add(1, std::memory_order_relaxed);
-  return false; // Exhausted all retries due to extreme contention
-} 

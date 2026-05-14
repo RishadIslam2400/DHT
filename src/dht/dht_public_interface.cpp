@@ -6,21 +6,20 @@
 #include <bit>
 #include <iostream>
 
-StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConfig self,
-                                           int hash_table_size, int num_locks, int rep_deg,
-                                           std::unique_ptr<IConsensusEngine> engine)
+StaticClusterDHTNode::StaticClusterDHTNode(
+  std::vector<NodeConfig> map, NodeConfig self, size_t hash_table_size, size_t num_locks,
+  int rep_deg)
   : cluster_map{std::move(map)}, 
     self_config{std::move(self)},
     storage{hash_table_size, num_locks},
     replication_degree{rep_deg},
     server_fd{-1},
     running{false},
-    connection_pool(cluster_map.size()),
+    connection_pool(map.empty() ? 0 : map.size()), 
     benchmark_ready{false},
-    consensus_engine(std::move(engine))
+    thread_pool(16) // Fixed number for now
 {
-  // Calculate optimal logical stripes
-  size_t target_stripes = std::min(static_cast<size_t>(2 * hash_table_size), static_cast<size_t>(4096));
+  size_t target_stripes = std::min(2 * hash_table_size, static_cast<size_t>(4096));
   num_logical_stripes = std::bit_ceil(std::max<size_t>(1, target_stripes)); 
   logical_stripe_mask = num_logical_stripes - 1;
 
@@ -32,9 +31,22 @@ StaticClusterDHTNode::StaticClusterDHTNode(std::vector<NodeConfig> map, NodeConf
 
   for (size_t i = 0; i < num_logical_stripes; ++i) {
     logically_locked_stripes[i].reserve(8);
-    // Pre-allocate the staging vectors as well to prevent mid-transaction resizing
+    // Pre-allocate the staging vectors
     staging_stripes[i].reserve(8); 
   }
+
+  // Safe reserve that explicitly prevents unsigned integer underflow
+  if (cluster_map.size() > 1) {
+    cached_peer_ids.reserve(cluster_map.size() - 1);
+  }
+
+  for (const auto& peer : cluster_map) {
+    if (peer.id != self_config.id) {
+      cached_peer_ids.push_back(peer.id);
+    }
+  }
+
+  this->consensus_engine = std::make_unique<RaftEngine>(this, this);
 
   std::cout << "Booted Node " << self_config.id
             << " (" << self_config.ip << ":" << self_config.port << ")" << std::endl;
@@ -47,7 +59,7 @@ StaticClusterDHTNode::~StaticClusterDHTNode() {
 void StaticClusterDHTNode::start() {
   running.store(true, std::memory_order_release);
   if (consensus_engine) {
-    consensus_engine->start(this);
+    consensus_engine->start();
   }
 
   listener_thread = std::thread(&StaticClusterDHTNode::listen_loop, this);
