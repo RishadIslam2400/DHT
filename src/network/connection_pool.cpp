@@ -109,20 +109,11 @@ int ConnectionPool::get_connection(const int target_id, const std::string &targe
 void ConnectionPool::return_connection(const int target_id, const int sock, const bool destroy) {
   if (destroy) {
     close(sock);
-
-    // If an active socket broke, assume the node crashed.
-    // Instantly blacklist the node so future get_connection() calls fast-fail.
-    dead_nodes[target_id].store(true, std::memory_order_relaxed);
-    
-    #ifndef NDEBUG
-      std::cerr << "[ConnectionPool] Active socket broke. Blacklisting Node " << target_id << ".\n";
-    #endif
     return;
   }
   
   std::unique_lock<Spinlock> lock(pools[target_id].pool_mtx.mutex);
   
-  // Bounds checking: Prevent File Descriptor Exhaustion
   if (pools[target_id].sockets.size() >= MAX_SOCKETS_PER_NODE) {
     lock.unlock();
     close(sock);
@@ -136,22 +127,28 @@ void ConnectionPool::pre_warm(const int target_id, const std::string &target_ip,
   temp_sockets.reserve(count);
 
   bool logged_waiting = false;
+  int max_attempts = 100; // 100 attempts * 50ms = 5 seconds timeout
+  int current_attempts = 0;
 
   while (temp_sockets.size() < static_cast<size_t>(count)) {
     int sock = create_new_connection(target_id, target_ip, target_port); 
     
     if (sock != -1) {
       temp_sockets.push_back(sock);
+      current_attempts = 0; // Reset on success in case we need multiple sockets
     } else {
+      current_attempts++;
+      if (current_attempts >= max_attempts) {
+        throw std::runtime_error("Pre-warm timeout: Node " + std::to_string(target_id) + " is unreachable.");
+      }
+
       if (!logged_waiting) {
         std::cout << "[ConnectionPool] Waiting for Node " << target_id 
                   << " (" << target_ip << ":" << target_port << ") to come online...\n";
         logged_waiting = true;
       }
       
-      // If pre-warm fails, un-blacklist it so we keep trying to boot the cluster
       dead_nodes[target_id].store(false, std::memory_order_relaxed);
-      
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   }

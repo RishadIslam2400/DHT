@@ -4,6 +4,7 @@ build/
 *.dylib
 *.dll
 *.exe
+*.out
 
 .vscode/
 .idea/

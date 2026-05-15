@@ -265,7 +265,7 @@ function cl_benchmark() {
   REPLICATION_DEGREES=(1 2 3)
   KEY_RANGES=(10 100 1000 10000)
   THREAD_COUNTS=(1 2 4 8 16 32)
-  RUNS=3
+  RUNS=1
 
   echo "Starting Benchmark Suite: ${#REPLICATION_DEGREES[@]} Repl Factors, ${#KEY_RANGES[@]} Ranges, ${RUNS} Runs each."
 
