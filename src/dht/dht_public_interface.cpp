@@ -1,5 +1,6 @@
 #include "dht/dht_static_partitioning.h"
 #include "dht/consensus_interface.h"
+#include "common/utils.h"
 
 #include <unistd.h>
 #include <sys/socket.h>
@@ -17,7 +18,7 @@ StaticClusterDHTNode::StaticClusterDHTNode(
     running{false},
     connection_pool(map.empty() ? 0 : map.size()), 
     benchmark_ready{false},
-    thread_pool(16) // Fixed number for now
+    thread_pool({1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15}) // 14 pinned threads
 {
   size_t target_stripes = std::min(2 * hash_table_size, static_cast<size_t>(4096));
   num_logical_stripes = std::bit_ceil(std::max<size_t>(1, target_stripes)); 
@@ -62,9 +63,13 @@ void StaticClusterDHTNode::start() {
     consensus_engine->start();
   }
 
-  listener_thread = std::thread(&StaticClusterDHTNode::listen_loop, this);
-  dispatcher_thread = std::thread(&StaticClusterDHTNode::recovery_dispatcher_loop, this);
   sweeper_thread = std::thread(&StaticClusterDHTNode::stale_lock_sweeper_loop, this);
+  pin_thread_to_control_cores(sweeper_thread);
+
+  dispatcher_thread = std::thread(&StaticClusterDHTNode::recovery_dispatcher_loop, this);
+  pin_thread_to_control_cores(dispatcher_thread);
+
+  listener_thread = std::thread(&StaticClusterDHTNode::listen_loop, this);
 }
 
 // Graceful shutdown sequence. Safely terminates active sockets to prevent data corruption.
@@ -86,7 +91,9 @@ void StaticClusterDHTNode::stop() {
     server_fd = -1;
   }
 
-  // Wake up all client threads (blocked in recv)
+  // Terminate Detached Client Threads
+  // Shutting down the sockets forces all blocking recv() calls to fail instantly.
+  // The detached threads will catch the error and quietly terminate themselves in the background.
   {
     std::lock_guard<std::mutex> lock(thread_mutex);
     for (int sock : active_sockets) {
@@ -96,23 +103,14 @@ void StaticClusterDHTNode::stop() {
     active_sockets.clear();
   }
 
+  // Unblock sleeping background threads
+  recovery_cv.notify_all();
+  sleep_cv.notify_all();
+
   // Join all background threads
   if (listener_thread.joinable()) listener_thread.join();
   if (dispatcher_thread.joinable()) dispatcher_thread.join();
   if (sweeper_thread.joinable()) sweeper_thread.join();
-
-  // Join all client threads
-  std::vector<std::thread> threads_to_join;
-  {
-    std::lock_guard<std::mutex> lock(thread_mutex);
-    threads_to_join.swap(client_threads);
-  }
-
-  for (std::thread &t : threads_to_join) {
-    if (t.joinable()) {
-      t.join();
-    }
-  }
   
   std::cout << "Node stopped gracefully." << std::endl;
 }

@@ -9,12 +9,20 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <pthread.h>
 
 class ThreadPool {
 public:
-  explicit ThreadPool(int num_threads) : stop(false) {
+  explicit ThreadPool(const std::vector<int>& target_cores) : stop(false) {
+    int num_threads = target_cores.size();
+
     for(int i = 0; i < num_threads; ++i) {
-      threads.emplace_back(std::thread(&ThreadPool::thread_func, this));
+      int core_id = target_cores[i];
+
+      threads.emplace_back([this, core_id]() {
+        this->pin_thread_to_core(core_id);
+        this->thread_func(); 
+      });
     }
   }
 
@@ -57,6 +65,15 @@ public:
   }
 
 private:
+  void pin_thread_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    pthread_t current_thread = pthread_self();
+    pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+  }
+
   void thread_func() {
     while (true) {
       std::function<void()> task;

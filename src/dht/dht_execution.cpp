@@ -1,4 +1,5 @@
 #include "dht/dht_static_partitioning.h"
+#include "dht/dht_transaction_manager.h"
 #include "common/xxHash64.h"
 #include "common/utils.h"
 
@@ -33,8 +34,17 @@ void StaticClusterDHTNode::stale_lock_sweeper_loop() {
   background_batcher.stats = &this->stats;
 
   while (running.load(std::memory_order_relaxed)) {
-    // Low frequency sleep to avoid stealing CPU cycles
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    {
+      std::unique_lock<std::mutex> lock(sleep_mtx);
+      sleep_cv.wait_for(lock, std::chrono::milliseconds(1000), [this]() {
+        return !running.load(std::memory_order_relaxed);
+      });
+    }
+
+    if (!running.load(std::memory_order_relaxed)) {
+        break;
+    }
+
     auto now = std::chrono::steady_clock::now();
 
     // Identify stale locks quickly without holding spinlocks for long
@@ -47,7 +57,8 @@ void StaticClusterDHTNode::stale_lock_sweeper_loop() {
       }
     }
 
-    if (stale_transactions.empty()) continue;
+    if (stale_transactions.empty())
+      continue;
 
     // Interrogate the coordinators
     for (const auto& [ts, coord_id] : stale_transactions) {
@@ -56,9 +67,9 @@ void StaticClusterDHTNode::stale_lock_sweeper_loop() {
 
       const NodeConfig& target = cluster_map[coord_id];
       TxCommitHeader header = { .tx_timestamp = ts };
-      uint8_t response = 0; // 0 = Aborted/Unknown, 1 = Committed
+      uint8_t response = 0;
 
-      // Send a Status RPC Check
+      // Try the original coordinator
       bool success = send_single_request(
         target.id, target.ip, target.port, ProtocolType::TwoPhaseCommit, 
         static_cast<uint8_t>(TwoPhaseCommitCommand::StatusCheck),
@@ -68,23 +79,48 @@ void StaticClusterDHTNode::stale_lock_sweeper_loop() {
       // Resolve the lock based on Coordinator's response
       if (success) {
         if (response == 1) {
-          #ifndef NDEBUG
-            std::cout << "[Sweeper] Recovered lost COMMIT for TX " << ts << "\n";
-          #endif
           local_tx_commit(ts, background_batcher);
         } else {
-          #ifndef NDEBUG
-            std::cout << "[Sweeper] Coordinator forgot TX " << ts << ". Forcing ABORT.\n";
-          #endif
           local_tx_abort(ts, background_batcher);
         }
       } else {
-          // Handle crash stop failure
-          // Abort locally
-          #ifndef NDEBUG
-            std::cout << "[Sweeper] Coordinator " << target.id << " is dead. Forcing abort for TX " << ts << ".\n";
-          #endif
-          local_tx_abort(ts, background_batcher);
+        // Coordinator is dead, contact Raft leader
+        if (consensus_engine) {
+          int leader_id = consensus_engine->get_leader_id();
+
+          if (leader_id == -1) {
+            // Cluster is electing a leader. Do nothing. Wait for the next sweeper loop.
+            continue;
+          }
+
+          if (leader_id == self_config.id) {
+            // Current node is the Raft leader
+            bool is_committed = tx_manager && tx_manager->is_transaction_committed(ts);
+            if (is_committed) {
+              local_tx_commit(ts, background_batcher);
+            } else {
+              local_tx_abort(ts, background_batcher);
+            }
+          } else {
+            // Enquire the Raft leader
+            const NodeConfig &leader_node = cluster_map[leader_id];
+            bool leader_success = send_single_request(
+              leader_node.id, leader_node.ip, leader_node.port, ProtocolType::TwoPhaseCommit, 
+              static_cast<uint8_t>(TwoPhaseCommitCommand::StatusCheck),
+              reinterpret_cast<const uint8_t*>(&header), sizeof(TxCommitHeader), &response, 1
+            );
+
+            if (leader_success) {
+              if (response == 1) {
+                local_tx_commit(ts, background_batcher);
+              } else {
+                local_tx_abort(ts, background_batcher);
+              }
+            }
+
+            // If leader failed to respond wait for next loop 
+          }
+        }
       }
     }
 

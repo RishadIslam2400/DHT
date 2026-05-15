@@ -36,7 +36,7 @@ public:
   // Read-Committed Isolation (Strictly Consistent GET)
   // Reads locally if possible, or load-balances across remote replicas.
   // Bypasses logical locks.
-  GetResponse get_sync(const uint32_t& key);
+  GetResponse get_sync(const uint32_t key);
 
   // Called by the Node's apply_committed_log() when Raft applies a CoordinatorCommitIntent.
   // Populates the volatile registry so the Coordinator can instantly answer Cohort checks.

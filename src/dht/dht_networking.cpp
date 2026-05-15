@@ -134,12 +134,8 @@ void StaticClusterDHTNode::listen_loop() {
         this->handle_client(new_socket);
       });
 
-      // Store the thread handle
-      {
-        std::lock_guard<std::mutex> lock(thread_mutex);
-        client_threads.push_back(std::move(client_thread));
-      }
-
+      pin_thread_to_control_cores(client_thread);
+      client_thread.detach();
     } catch (const std::system_error& e) {
       log_error("CRITICAL: OS refused to spawn more threads! Dropping connection.", errno);
       
@@ -255,6 +251,24 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
             if (send(client_socket, &response, sizeof(GetResponse), MSG_NOSIGNAL) != sizeof(GetResponse)) [[unlikely]]
               goto cleanup;
 
+            break;
+          }
+
+          case DhtCommand::LogIntent: {
+            uint8_t response = 0;
+
+            // Only propose command if this node is currently the Raft Leader
+            if (consensus_engine && consensus_engine->get_role() == ConsensusRole::LEADER) {
+              // Propose the intent to the Raft WAL.
+              // This function will naturally block until a Control Quorum (majority) is reached.
+              bool success = consensus_engine->propose_command(payload_ptr, env.payload_size);
+              response = success ? 1 : 0;
+            }
+
+            // Send the ACK/NACK back to the Follower who is coordinating the transaction
+            if (send(client_socket, &response, 1, MSG_NOSIGNAL) != 1) [[unlikely]] {
+              goto cleanup;
+            }
             break;
           }
 
@@ -390,12 +404,8 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
 
 // Background recovery thread
 void StaticClusterDHTNode::recovery_dispatcher_loop() {
-  // Allocate buffers with minimal capacity
   std::vector<RecoveryTask> tasks_to_process;
   tasks_to_process.reserve(32);
-
-  std::vector<std::future<void>> dispatch_futures;
-  dispatch_futures.reserve(32);
 
   while (running.load(std::memory_order_relaxed)) {
     {
@@ -415,35 +425,22 @@ void StaticClusterDHTNode::recovery_dispatcher_loop() {
       tasks_to_process.swap(recovery_queue);
     }
 
-    // Check the leader
-    if (!consensus_engine || consensus_engine->get_role() != ConsensusRole::LEADER) {
-      tasks_to_process.clear();
-      continue;
-    }
-
-    // Process the Phase 2 intents asynchronously
+    // Use thread pool to execute transactions
     for (const auto& task : tasks_to_process) {
-      dispatch_futures.push_back(
-        this->thread_pool.submit_task([this, task]() {
-          TelemetryBatcher local_batcher;
-          local_batcher.stats = &this->stats;
+      this->thread_pool.submit_task([this, task]() {
+        TelemetryBatcher local_batcher;
+        local_batcher.stats = &this->stats;
 
-          if (task.cmd == TwoPhaseCommitCommand::Commit) {
-            this->send_tx_commit(task.target_id, task.tx_timestamp, local_batcher);
-          } else {
-            this->send_tx_abort(task.target_id, task.tx_timestamp, local_batcher);
-          }
-        })
-      );
-    }
- 
-    for (auto& fut : dispatch_futures) {
-      fut.get();
+        if (task.cmd == TwoPhaseCommitCommand::Commit) {
+          this->send_tx_commit(task.target_id, task.tx_timestamp, local_batcher);
+        } else {
+          this->send_tx_abort(task.target_id, task.tx_timestamp, local_batcher);
+        }
+      });
     }
 
     // Clear local buffers for the next iteration
     tasks_to_process.clear();
-    dispatch_futures.clear();
   }
 }
 
@@ -478,7 +475,7 @@ bool StaticClusterDHTNode::recv_n_bytes(const int sock, void* buffer, const size
   return true;
 }
 
-void StaticClusterDHTNode::perform_rpc_fire_and_forget(
+bool StaticClusterDHTNode::perform_rpc_fire_and_forget(
   int sock, ProtocolType proto, uint8_t cmd, const uint8_t* payload, size_t size
 ) {
     NetworkEnvelope env{};
@@ -504,7 +501,10 @@ void StaticClusterDHTNode::perform_rpc_fire_and_forget(
 
     // MSG_DONTWAIT prevents the thread from blocking if TCP buffer is full
     // MSG_NOSIGNAL prevents crashing if the peer disconnected
-    sendmsg(sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    ssize_t sent = sendmsg(sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    
+    // Return true if the kernel successfully accepted the bytes
+    return sent >= 0; 
 }
 
 // Scatter-Gather I/O execution

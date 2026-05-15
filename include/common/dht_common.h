@@ -19,7 +19,8 @@ enum class DhtCommand : uint8_t {
   Get = 0x03,         // Single read operation
   Barrier = 0x05,     // Distributed barrier to start benchmark
   Quit = 0x06,        // Shutdown signal
-  ExitBarrier = 0x07  // Exit sync
+  ExitBarrier = 0x07, // Exit sync
+  LogIntent = 0x08    // Follower asks Leader to write 2PC intent to global WAL
 };
 
 // 0x10 - 0x1F: 2PC Commands
@@ -75,7 +76,6 @@ enum class ConsensusRole : uint8_t {
 enum class TransactionResult : uint8_t {
   Committed = 0,
   Aborted = 1,
-  NotLeader = 2  // Indicates the network layer must forward this!
 };
 
 struct LocalValue {

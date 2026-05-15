@@ -12,7 +12,7 @@ public:
     virtual ~IStateMachine() = default;
     
     // The Consensus engine calls this only when a log is safely replicated to a quorum
-    virtual void apply_committed_log(uint64_t commit_index, const uint8_t* data, size_t data_len) = 0;
+    virtual void apply_committed_log(const std::vector<std::pair<uint64_t, std::vector<uint8_t>>>& committed_batch) = 0;
 };
 
 // Define an interfor the DHT to send packets

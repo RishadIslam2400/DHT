@@ -100,6 +100,14 @@ int ConnectionPool::get_connection(const int target_id, const std::string &targe
 void ConnectionPool::return_connection(const int target_id, const int sock, const bool destroy) {
   if (destroy) {
     close(sock);
+
+    // If an active socket broke, assume the node crashed.
+    // Instantly blacklist the node so future get_connection() calls fast-fail.
+    dead_nodes[target_id].store(true, std::memory_order_relaxed);
+    
+    #ifndef NDEBUG
+      std::cerr << "[ConnectionPool] Active socket broke. Blacklisting Node " << target_id << ".\n";
+    #endif
     return;
   }
   

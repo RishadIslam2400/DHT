@@ -78,7 +78,6 @@ private:
   std::thread listener_thread;
   std::thread dispatcher_thread;
   std::thread sweeper_thread;
-  std::vector<std::thread> client_threads;
 
   // Socket Tracking
   std::mutex thread_mutex;
@@ -112,6 +111,9 @@ private:
   std::condition_variable recovery_cv;
   std::vector<RecoveryTask> recovery_queue;
 
+  std::mutex sleep_mtx;
+  std::condition_variable sleep_cv;
+  
   // =========================================================================
   // Inline Routing & Utility Functions
   // =========================================================================
@@ -157,7 +159,7 @@ private:
 
   static bool recv_n_bytes(const int sock, void *buffer, const size_t n);
 
-  void perform_rpc_fire_and_forget(
+  bool perform_rpc_fire_and_forget(
     int sock, ProtocolType proto, uint8_t cmd, const uint8_t *payload, size_t size
   );
 
@@ -208,7 +210,7 @@ private:
   // Consensus Engine Interfaces
   // =========================================================================
   
-  void apply_committed_log(uint64_t commit_index, const uint8_t* data, size_t data_len) override;
+  void apply_committed_log(const std::vector<std::pair<uint64_t, std::vector<uint8_t>>>& committed_batch) override;
   
   void send_message(int target_node_id, ProtocolType proto, uint8_t command_type,
                     const uint8_t* payload, size_t payload_size) override;

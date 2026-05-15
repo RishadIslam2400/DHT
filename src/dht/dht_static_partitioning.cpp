@@ -15,67 +15,68 @@
 #include <bit>
 #include <random>
 
-void StaticClusterDHTNode::apply_committed_log(uint64_t commit_index, const uint8_t *data, size_t data_len) {
-  if (data_len < 1) [[unlikely]]
+void StaticClusterDHTNode::apply_committed_log(const std::vector<std::pair<uint64_t, std::vector<uint8_t>>>& committed_batch) {
+  if (committed_batch.empty())
     return;
 
-  // Extract the log type
-  uint8_t log_type = data[0];
-  const uint8_t* payload = data + 1;
-  size_t payload_size = data_len - 1;
+  bool needs_dispatch = false;
 
-  switch (log_type) {
-    // Case A: Standard replicated KV storage
-    case static_cast<uint8_t>(DhtCommand::Put): {
-      if (payload_size == sizeof(PutRequest)) [[likely]] {
-        PutRequest req;
-        std::memcpy(&req, payload, sizeof(PutRequest));
-        synchronize_clock(req.timestamp);
-        storage.put(req.key, req.value, req.timestamp);
-      }
-      break;
-    }
+  // Lock the recovery queue for the entire batch
+  std::unique_lock<std::mutex> lock(recovery_mtx, std::defer_lock);
 
-    // Case B: Replicated 2PC coordinator log
-    case static_cast<uint8_t>(TwoPhaseCommitCommand::Commit):
-    case static_cast<uint8_t>(TwoPhaseCommitCommand::Abort): {
-      if (payload_size == sizeof(CoordinatorCommitIntent)) [[likely]] {
+  bool is_leader = (consensus_engine && consensus_engine->get_role() == ConsensusRole::LEADER);
+  if (is_leader) {
+    lock.lock();
+    recovery_queue.reserve(recovery_queue.size() + (committed_batch.size() * 3));
+  }
+
+  for (const auto& [commit_index, data_vec] : committed_batch) {
+    if (data_vec.empty())
+      continue;
+
+    // Extract the log type
+    uint8_t log_type = data_vec[0];
+    const uint8_t* payload = data_vec.data() + 1;
+    size_t payload_size = data_vec.size() - 1;
+
+    if (log_type == static_cast<uint8_t>(TwoPhaseCommitCommand::Commit) ||
+        log_type == static_cast<uint8_t>(TwoPhaseCommitCommand::Abort)) {
+
+      if (payload_size == sizeof(CoordinatorCommitIntent))[[likely]] {
         CoordinatorCommitIntent intent;
         std::memcpy(&intent, payload, sizeof(CoordinatorCommitIntent));
 
         bool is_commit = (intent.decision == 1);
         TwoPhaseCommitCommand phase2_cmd = is_commit ? TwoPhaseCommitCommand::Commit 
-                                                     : TwoPhaseCommitCommand::Abort;
+                                                    : TwoPhaseCommitCommand::Abort;
 
         // Update the decision to transaction manager for fast status check
         if (tx_manager) [[likely]] {
-            tx_manager->record_transaction_decision(intent.tx_timestamp, is_commit);
+          tx_manager->record_transaction_decision(intent.tx_timestamp, is_commit);
         }
 
-        // Push to recovery queue
-        {
-          std::lock_guard<std::mutex> lock(recovery_mtx);
-          recovery_queue.reserve(recovery_queue.size() + intent.num_shards);
-          
+        // Raft leader handles the recovery loop
+        if (is_leader) {          
           for (uint16_t i = 0; i < intent.num_shards; ++i) {
             recovery_queue.push_back({intent.target_shards[i], phase2_cmd, intent.tx_timestamp});
           }
+          needs_dispatch = true;
         }
-
-        recovery_cv.notify_all();
       }
-      break;
-    }
-
-    default:
+    } else {
       #ifndef NDEBUG
         std::cerr << "[State Machine] Unknown log discriminator: " << static_cast<int>(log_type) << "\n";
       #endif
-      break;
+    }
   }
 
-  // Advance the state machine index
-  stats.consensus_state_machine_applied.fetch_add(1, std::memory_order_relaxed);
+  // Notify the dispatcher
+    if (is_leader && needs_dispatch) {
+      lock.unlock();
+      recovery_cv.notify_all();
+    }
+
+  stats.consensus_state_machine_applied.fetch_add(committed_batch.size(), std::memory_order_relaxed);
 }
 
 void StaticClusterDHTNode::send_message(int target_node_id, ProtocolType proto, uint8_t command_type,
@@ -96,8 +97,10 @@ void StaticClusterDHTNode::send_message(int target_node_id, ProtocolType proto, 
   int sock = connection_pool.get_connection(target.id, target.ip, target.port);
   if (sock >= 0) {
       // Dispatch immediately and return
-      perform_rpc_fire_and_forget(sock, proto, command_type, payload, payload_size);
-      connection_pool.return_connection(target.id, sock, false);
+      bool success = perform_rpc_fire_and_forget(sock, proto, command_type, payload, payload_size);
+
+      // If success is false, the pool will destroy the socket and temporarily blacklist the node
+      connection_pool.return_connection(target.id, sock, !success);
   }
 }
 

@@ -73,7 +73,7 @@ private:
   std::mutex apply_mutex;
 
   // Commit Awaiter (Blocks propose_command until quorum is reached)
-  std::condition_variable commit_cv;
+  std::condition_variable_any commit_cv;
 
   // Configuration
   int election_timeout_min_ms{150};
