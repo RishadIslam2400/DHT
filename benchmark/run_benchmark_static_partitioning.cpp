@@ -190,8 +190,18 @@ int main(int argc, char** argv) {
       consensus->start(); 
     }
 
-    node.warmup_network(num_threads);
-    node.wait_for_barrier();
+    try {
+        node.warmup_network(num_threads);
+    } catch (const std::exception& e) {
+        std::cerr << "[DEBUG] CRASH IN WARMUP_NETWORK: " << e.what() << std::endl;
+        throw; // Re-throw to trigger graceful shutdown
+    }
+    try {
+        node.wait_for_barrier();
+    } catch (const std::exception& e) {
+        std::cerr << "[DEBUG] CRASH IN WAIT_FOR_BARRIER: " << e.what() << std::endl;
+        throw;
+    }
 
     // Wait for the cluster to elect a leader
     #ifndef NDEBUG
@@ -308,8 +318,8 @@ int main(int argc, char** argv) {
     std::cout << "[TestApp] Shutdown complete." << std::endl;
 
   } catch (const std::exception& e) {
-      std::cerr << "[Fatal Error] " << e.what() << std::endl;
-      return 1;
+    std::cerr << "[Fatal Error] " << e.what() << std::endl;
+    return 1;
   }
 
   return 0;
