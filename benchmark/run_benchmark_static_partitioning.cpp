@@ -190,19 +190,10 @@ int main(int argc, char** argv) {
       consensus->start(); 
     }
 
-    try {
-        node.warmup_network(num_threads);
-    } catch (const std::exception& e) {
-        std::cerr << "[DEBUG] CRASH IN WARMUP_NETWORK: " << e.what() << std::endl;
-        throw; // Re-throw to trigger graceful shutdown
-    }
-    try {
-        node.wait_for_barrier();
-    } catch (const std::exception& e) {
-        std::cerr << "[DEBUG] CRASH IN WAIT_FOR_BARRIER: " << e.what() << std::endl;
-        throw;
-    }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
+    node.warmup_network(num_threads);
+    node.wait_for_barrier();
     // Wait for the cluster to elect a leader
     #ifndef NDEBUG
       if (node_id == 0) {

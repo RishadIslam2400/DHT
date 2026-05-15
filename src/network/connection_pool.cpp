@@ -10,7 +10,16 @@
 #include <thread>
 
 // Constructor and destructor
-ConnectionPool::ConnectionPool(int num_nodes) : pools(num_nodes) {}
+ConnectionPool::ConnectionPool(int num_nodes) : pools(num_nodes) {
+  if (num_nodes > 0) {
+    dead_nodes = std::make_unique<std::atomic<bool>[]>(num_nodes);
+    
+    // Explicitly initialize each atomic to false
+    for (int i = 0; i < num_nodes; ++i) {
+      dead_nodes[i].store(false, std::memory_order_relaxed);
+    }
+  }
+}
 
 ConnectionPool::~ConnectionPool() {
   for (TargetPool& target_pool : pools) {
