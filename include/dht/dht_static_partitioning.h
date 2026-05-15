@@ -182,12 +182,7 @@ private:
   void stale_lock_sweeper_loop();
 
   // Storage Engine operations
-  PutResult put_local(const uint32_t key, const uint32_t value, const uint64_t timestamp,
-                      TelemetryBatcher& batcher);
   std::optional<LocalValue> get_local(const uint32_t key, TelemetryBatcher& batcher) const;
-  
-  PutResult put_remote(const uint32_t key, const uint32_t value, const uint64_t timestamp,
-                       const NodeConfig &target, TelemetryBatcher& batcher);
   GetResponse get_remote(const uint32_t key, const uint64_t read_ts,
                          const NodeConfig &target, TelemetryBatcher& batcher);
 

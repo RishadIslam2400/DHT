@@ -152,9 +152,18 @@ TransactionResult DHTTransactionManager::execute_transaction(const std::vector<s
     }
   }
 
-  // Phase 2: Commit/Abort
+  // Phase 2: Commit
   if (consensus_achieved) {
     for (int i = 0; i < intent.num_shards; ++i) {
+      int target_id = intent.target_shards[i];
+      
+      // Grab the size of the payload being sent to this specific shard
+      size_t keys_in_shard = cohort_batches[target_id].size();
+
+      if (target_id != dht_node.self_config.id) {
+        dht_node.stats.remote_puts_success.fetch_add(keys_in_shard, std::memory_order_relaxed);
+      }
+
       dht_node.thread_pool.submit_task([&dht_node = this->dht_node, target_id = intent.target_shards[i], tx_ts]() {
          TelemetryBatcher local_batcher;
          local_batcher.stats = &dht_node.stats;
@@ -164,11 +173,19 @@ TransactionResult DHTTransactionManager::execute_transaction(const std::vector<s
     return TransactionResult::Committed;
   }
 
+  // Phase 2: Abort (Rollback Path)
   intent.decision = 0;
   record_transaction_decision(tx_ts, false);
   
   for (int i = 0; i < intent.num_shards; ++i) {
-    dht_node.enqueue_for_async_recovery(intent.target_shards[i], TwoPhaseCommitCommand::Abort, tx_ts);
+    int target_id = intent.target_shards[i];
+    size_t keys_in_shard = cohort_batches[target_id].size();
+
+    if (target_id != dht_node.self_config.id) {
+      dht_node.stats.remote_puts_failed.fetch_add(keys_in_shard, std::memory_order_relaxed);
+    }
+
+    dht_node.enqueue_for_async_recovery(target_id, TwoPhaseCommitCommand::Abort, tx_ts);
   }
 
   return TransactionResult::Aborted;

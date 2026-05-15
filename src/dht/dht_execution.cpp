@@ -129,59 +129,6 @@ void StaticClusterDHTNode::stale_lock_sweeper_loop() {
   }
 }
 
-PutResult StaticClusterDHTNode::put_local(const uint32_t key, const uint32_t value,
-                                          const uint64_t timestamp, TelemetryBatcher& batcher) {
-  // Optional: Track storage latency
-  // auto start_time = std::chrono::high_resolution_clock::now();
-
-  constexpr int MAX_RETRIES = 1000;
-  uint16_t attempt = 0;
-
-  size_t stripe = hash_key(key) & logical_stripe_mask;
-  PutResult result;
-
-  // Check logically locked keys
-  while (true) {
-    {
-      // Acquire the logical stripe Spinlock
-      std::lock_guard<Spinlock> lock(stripe_locks[stripe].mutex);
-      std::vector<uint32_t>& locked_keys = logically_locked_stripes[stripe];
-
-      // Check for 2PC logical locks
-      if (std::find(locked_keys.begin(), locked_keys.end(), key) == locked_keys.end()) [[likely]] {
-        // Insert while holding logical locks stripes so no other 2PC transactions can change it
-        result = storage.put(key, value, timestamp);
-        break;
-      }
-    } // Logical lock released
-
-    // Backoff strategy if the key is logically locked by an active 2PC
-    attempt++;
-    if (attempt >= MAX_RETRIES) {
-      return PutResult::Failed;
-    }
-
-    if (attempt < 100) {
-      #if defined(__x86_64__) || defined(_M_X64)
-        __builtin_ia32_pause(); 
-      #elif defined(__aarch64__) || defined(__arm__)
-        // Hardware-level pipeline yield for ARM (does not context switch)
-        asm volatile("yield" ::: "memory"); 
-      #else
-        // If an unknown architecture, spin quietly
-      #endif
-    } else {
-      std::this_thread::yield();
-    }
-  }
-
-  if (result == PutResult::Inserted) [[likely]] batcher.local_inserted++;
-  else if (result == PutResult::Updated) [[likely]] batcher.local_updated++;
-  else [[unlikely]] batcher.local_dropped++;
-
-  return result;
-}
-
 std::optional<LocalValue> StaticClusterDHTNode::get_local(const uint32_t key,
                                                         TelemetryBatcher& batcher) const
 {
@@ -195,42 +142,6 @@ std::optional<LocalValue> StaticClusterDHTNode::get_local(const uint32_t key,
   }
 
   return res;
-}
-
-PutResult StaticClusterDHTNode::put_remote(
-  const uint32_t key, const uint32_t value, const uint64_t timestamp,
-  const NodeConfig &target, TelemetryBatcher& batcher
-) {
-  PutRequest req{key, value, timestamp};
-  uint8_t response_byte = 0;
-
-  auto start_time = std::chrono::high_resolution_clock::now();
-  bool success = send_single_request(
-    target.id, target.ip, target.port, ProtocolType::ClientDht,
-    static_cast<uint8_t>(DhtCommand::Put), reinterpret_cast<const uint8_t*>(&req),
-    sizeof(PutRequest), &response_byte, 1
-  );
-
-  auto end_time = std::chrono::high_resolution_clock::now();
-  uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-
-  batcher.remote_put_ns += duration_ns;
-
-  PutResult result = PutResult::Failed;
-
-  if (success) [[likely]] {
-    result = static_cast<PutResult>(response_byte); 
-
-    if (result == PutResult::Inserted || result == PutResult::Updated) [[likely]] {
-      batcher.remote_put_success++;
-    } else {
-      batcher.remote_put_failed++;
-    }
-  } else [[unlikely]] {
-    batcher.remote_put_failed++;
-  }
-
-  return result;
 }
 
 GetResponse StaticClusterDHTNode::get_remote(const uint32_t key, const uint64_t read_ts,
@@ -398,16 +309,15 @@ void StaticClusterDHTNode::local_tx_commit(const uint64_t tx_timestamp, Telemetr
   if (batch_to_commit.size() == 1) {
     PutResult res = storage.put(batch_to_commit[0].first, batch_to_commit[0].second, tx_timestamp);
 
-    if (res == PutResult::Inserted) {
-      batcher.local_inserted++;
-    } else if (res == PutResult::Updated) {
-      batcher.local_updated++;
-    } else {
-      batcher.local_dropped++;
-    }
+    if (res == PutResult::Inserted) batcher.local_inserted++;
+    else if (res == PutResult::Updated) batcher.local_updated++;
+    else batcher.local_dropped++;
   } else {
-    storage.multi_put(batch_to_commit.data(), batch_to_commit.size(), tx_timestamp);
-    batcher.local_inserted += batch_to_commit.size();
+    auto [inserted, updated] = storage.multi_put(batch_to_commit.data(), batch_to_commit.size(), tx_timestamp);
+    
+    batcher.local_inserted += inserted;
+    batcher.local_updated += updated;
+    batcher.local_dropped += (batch_to_commit.size() - inserted - updated);
   }
 
   std::sort(batch_to_commit.begin(), batch_to_commit.end(), [this](const auto& a, const auto& b)
@@ -539,6 +449,24 @@ bool StaticClusterDHTNode::send_tx_prepare(
     batcher.coord_tx_failed++;
     return false;
   }
+
+  // Local Partition Execution
+  if (target_id == self_config.id) [[unlikely]] {
+    bool success = local_tx_prepare(tx_timestamp, self_config.id, batch, batcher);
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    batcher.coord_prepare_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    
+    if (success) {
+      batcher.coord_prepare_success++;
+    } else {
+      batcher.coord_tx_failed++;
+    }
+    return success;
+  }
+
+  
+  // Remote execution
   const NodeConfig &target = cluster_map[target_id];
 
   size_t batch_size = batch.size();
@@ -597,6 +525,19 @@ bool StaticClusterDHTNode::send_tx_commit(const int target_id, const uint64_t tx
   if (target_id < 0 || target_id >= static_cast<int>(cluster_map.size())) [[unlikely]] {
     return false;
   }
+
+  // Local Partition Execution
+  if (target_id == self_config.id) [[unlikely]] {
+    local_tx_commit(tx_timestamp, batcher);
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    batcher.coord_phase2_commit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    batcher.coord_tx_committed++;
+    return true;
+  }
+
+  // Remote execution
+
   const NodeConfig &target = cluster_map[target_id];
 
   // Instantiate the header
@@ -635,6 +576,17 @@ bool StaticClusterDHTNode::send_tx_abort(const int target_id, const uint64_t tx_
   if (target_id < 0 || target_id >= static_cast<int>(cluster_map.size())) [[unlikely]] {
     return false;
   }
+
+  //Local Partition Execution
+  if (target_id == self_config.id) [[unlikely]] {
+    local_tx_abort(tx_timestamp, batcher);
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    batcher.coord_phase2_commit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    return true;
+  }
+
+  // Remote execution
   const NodeConfig &target = cluster_map[target_id];
 
   TxCommitHeader header = {

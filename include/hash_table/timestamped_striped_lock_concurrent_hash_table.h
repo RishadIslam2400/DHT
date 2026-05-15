@@ -117,8 +117,11 @@ public:
   }
 
   // Multi-Put Phase 2 Commit
-  void multi_put(const std::pair<K, V>* items, size_t batch_size, const uint64_t tx_timestamp) {
-    if (batch_size == 0) return;
+  std::pair<int, int> multi_put(const std::pair<K, V>* items, size_t batch_size, const uint64_t tx_timestamp) {
+    if (batch_size == 0) return {0, 0};
+
+    int total_inserted = 0;
+    int total_updated = 0;
 
     // Stack allocation for lock deduplication
     constexpr size_t MAX_BATCH = 64;
@@ -169,6 +172,7 @@ public:
           if (tx_timestamp > item.timestamp) [[likely]] {
             item.value = item_pair.second;
             item.timestamp = tx_timestamp;
+            total_updated++;
           }
           found = true;
           break;
@@ -177,7 +181,8 @@ public:
 
       if (!found) {
         bucket.push_back({item_pair.first, item_pair.second, tx_timestamp});
-        
+        total_inserted++;
+
         // Find which unique lock this belonged to and tally it
         for (size_t j = 0; j < num_unique_locks; ++j) {
           if (sorted_locks[j] == lock_idx) {
@@ -195,6 +200,8 @@ public:
       }
       table_mutexes[sorted_locks[i]].mutex.unlock();
     }
+
+    return {total_inserted, total_updated}
   }
 
   std::optional<LocalValue> get(const K& key) const {
