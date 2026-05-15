@@ -396,9 +396,18 @@ void StaticClusterDHTNode::local_tx_commit(const uint64_t tx_timestamp, Telemetr
 
   // Insert into local storage
   if (batch_to_commit.size() == 1) {
-    storage.put(batch_to_commit[0].first, batch_to_commit[0].second, tx_timestamp);
+    PutResult res = storage.put(batch_to_commit[0].first, batch_to_commit[0].second, tx_timestamp);
+
+    if (res == PutResult::Inserted) {
+      batcher.local_inserted++;
+    } else if (res == PutResult::Updated) {
+      batcher.local_updated++;
+    } else {
+      batcher.local_dropped++;
+    }
   } else {
     storage.multi_put(batch_to_commit.data(), batch_to_commit.size(), tx_timestamp);
+    batcher.local_inserted += batch_to_commit.size();
   }
 
   std::sort(batch_to_commit.begin(), batch_to_commit.end(), [this](const auto& a, const auto& b)
