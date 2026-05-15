@@ -201,7 +201,7 @@ public:
       table_mutexes[sorted_locks[i]].mutex.unlock();
     }
 
-    return {total_inserted, total_updated}
+    return {total_inserted, total_updated};
   }
 
   std::optional<LocalValue> get(const K& key) const {
