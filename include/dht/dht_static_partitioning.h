@@ -263,4 +263,6 @@ public:
     
     return next_clock;
   }
+
+  IConsensusEngine* get_consensus_engine() const { return consensus_engine.get(); }
 };

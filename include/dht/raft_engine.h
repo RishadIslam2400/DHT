@@ -55,6 +55,7 @@ private:
 
   // Volatile state on Candidates
   int votes_received{0};
+  std::vector<bool> peers_voted;
 
   // ====================================================================
   // CONCURRENCY
@@ -93,14 +94,14 @@ private:
   void handle_append_entries(uint32_t sender_id, const uint8_t* payload, size_t size);
   void handle_append_reply(uint32_t sender_id, const uint8_t* payload, size_t size);
 
-  // Checks if a quorum has been reached to safely advance the commit_index
-  void advance_commit_index();
-
   // Resolve conflicting entries
   void truncate_log(size_t new_size);
 
+  void dispatch_append_reply(uint32_t target_id, const RaftAppendReplyHeader &reply);
+  void dispatch_vote_reply(uint32_t target_id, const RaftVoteReplyHeader& reply);
+
 public:
-  explicit RaftEngine(IStateMachine* sm, INetworkTransport* nt);
+  explicit RaftEngine(INetworkTransport* nt, IStateMachine* sm);
   ~RaftEngine() override;
 
   // IConsensusEngine interface

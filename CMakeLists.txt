@@ -4,7 +4,7 @@ project(DistributedHashTable LANGUAGES CXX)
 enable_testing()
 
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
 endif()
 set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo")
 
@@ -14,23 +14,33 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT ipo_supported OUTPUT error)
+  if(ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    message(STATUS "IPO / LTO Enabled: Max compiler optimizations active")
+  else()
+    message(WARNING "IPO / LTO is not supported by your compiler: ${error}")
+  endif()
+endif()
+
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+  add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -Wno-unused-parameter)
-    add_link_options(-static-libstdc++ -static-libgcc)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -DNDEBUG")
+  add_compile_options(-Wall -Wextra -Wno-unused-parameter -Werror)
+  add_link_options(-static-libstdc++ -static-libgcc)
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -g -march=native -DNDEBUG")
 endif()
 
 find_package(Threads REQUIRED)
-include_directories(include)
 
 add_library(common_lib
-    src/common/MurmurHash3.cpp
     src/common/utils.cpp
 )
 
+target_include_directories(common_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(dht_lib 
     src/dht/dht_static_partitioning.cpp
     src/dht/dht_networking.cpp
@@ -43,26 +53,7 @@ add_library(dht_lib
 )
 target_link_libraries(dht_lib PUBLIC common_lib Threads::Threads)
 
-# Suppressing tests since all tests passed
-
-# Concurrent hash table test
-# add_executable(test_striped_lock_hash_table tests/test_striped_lock_concurrent_hash_table.cpp)
-# target_link_libraries(test_striped_lock_hash_table PRIVATE Threads::Threads)
-# add_test(NAME ConcurrentHashTableTest COMMAND test_striped_lock_hash_table)
-
-add_executable(test_ts_hash_table tests/test_ts_hash_table.cpp)
-target_link_libraries(test_ts_hash_table PRIVATE Threads::Threads)
-add_test(NAME ConcurrentHashTableTest COMMAND test_ts_hash_table)
-
-# Connection pool test
-# add_executable(test_connection_pool tests/test_connection_pool.cpp)
-# target_link_libraries(test_connection_pool PRIVATE dht_lib)
-# add_test(NAME ConnectionPoolTest COMMAND test_connection_pool)
-
-# RHT Static Partitioning Test
-# add_executable(test_rht tests/test_rht.cpp)
-# target_link_libraries(test_rht PRIVATE dht_lib)
-# add_test(NAME RHTTest COMMAND test_rht)
+# No test files exist currently
 
 # DHT Static Partitioning Benchmark
 add_executable(run_benchmark_static_partitioning benchmark/run_benchmark_static_partitioning.cpp)

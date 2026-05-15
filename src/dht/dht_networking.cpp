@@ -53,7 +53,7 @@ void StaticClusterDHTNode::listen_loop() {
   // server_fd socket accepts incoming connections in a persistent loop until the system is running
   while (running.load(std::memory_order_relaxed)) {
     // initialize client address to store client information
-    sockaddr_in client_addr = {0};
+    sockaddr_in client_addr{};
     socklen_t client_addr_len = sizeof(client_addr);
 
     // accept a incoming connection that returns a new_socket to communicate with the 
@@ -227,7 +227,7 @@ void StaticClusterDHTNode::handle_client(int client_socket) {
             );
             
             response_buffer.assign(batch_count, final_status);
-            if (send(client_socket, response_buffer.data(), batch_count, MSG_NOSIGNAL) != batch_count) [[unlikely]] {
+            if (send(client_socket, response_buffer.data(), batch_count, MSG_NOSIGNAL) != static_cast<ssize_t>(batch_count)) [[unlikely]] {
                 goto cleanup;
             }
             break;
@@ -495,7 +495,7 @@ bool StaticClusterDHTNode::perform_rpc_fire_and_forget(
         iovcnt = 2;
     }
 
-    struct msghdr msg = {0};
+    struct msghdr msg{};
     msg.msg_iov = iov;
     msg.msg_iovlen = iovcnt;
 

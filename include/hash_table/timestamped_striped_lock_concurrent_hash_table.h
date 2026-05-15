@@ -20,12 +20,25 @@ struct Ht_item {
   uint64_t timestamp; // Logical clock commit timestamp
 };
 
+struct alignas(64) AlignedAtomicInt {
+  std::atomic<int> val{0};
+
+  AlignedAtomicInt& operator=(int v) { 
+    val.store(v, std::memory_order_relaxed);
+    return *this;
+  }
+
+  int operator++(int) { return val.fetch_add(1, std::memory_order_relaxed); }
+  int operator--(int) { return val.fetch_sub(1, std::memory_order_relaxed); }
+  int load(std::memory_order order = std::memory_order_seq_cst) const { return val.load(order); }
+};
+
 template <typename K, typename V>
 class TimestampedStripedLockConcurrentHashTable {
 private:
   // Storage member variables
   std::vector<std::vector<Ht_item<K, V>>> table;
-  std::unique_ptr<alignas(64) std::atomic<int>[]> striped_counts;
+  std::unique_ptr<AlignedAtomicInt[]> striped_counts;
   int capacity;
   
   // Concurrency member variables
@@ -57,10 +70,10 @@ public:
 
     table.resize(capacity);
     table_mutexes = std::make_unique<AlignedSpinlock[]>(num_locks);
-    striped_counts = std::make_unique<std::atomic<int>[]>(num_locks);
+    striped_counts = std::make_unique<AlignedAtomicInt[]>(num_locks);
 
     for (int i = 0; i < num_locks; ++i) {
-      striped_counts[i].store(0, std::memory_order_relaxed);
+      striped_counts[i].val.store(0, std::memory_order_relaxed);
     }
 
     for (int i = 0; i < capacity; ++i) {
@@ -99,7 +112,7 @@ public:
 
     // Key not found, append new entry
     bucket.push_back({key, value, incoming_ts});
-    striped_counts[lock_idx].fetch_add(1, std::memory_order_relaxed);
+    striped_counts[lock_idx].val.fetch_add(1, std::memory_order_relaxed);
     return PutResult::Inserted;
   }
 
@@ -178,7 +191,7 @@ public:
     // Update striped counters & release locks
     for (int i = static_cast<int>(num_unique_locks) - 1; i >= 0; --i) {
       if (inserts_per_lock[i] > 0) {
-        striped_counts[sorted_locks[i]].fetch_add(inserts_per_lock[i], std::memory_order_relaxed);
+        striped_counts[sorted_locks[i]].val.fetch_add(inserts_per_lock[i], std::memory_order_relaxed);
       }
       table_mutexes[sorted_locks[i]].mutex.unlock();
     }

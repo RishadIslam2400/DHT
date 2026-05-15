@@ -1,5 +1,6 @@
 #include "dht/dht_static_partitioning.h"
 #include "dht/dht_transaction_manager.h"
+#include "dht/raft_engine.h"
 
 #include <random>
 #include <iomanip>
@@ -117,7 +118,7 @@ void do_benchmark(StaticClusterDHTNode* node, int thread_id, int ops_count,
     const OpData &op = ops_ptr[i];
 
     if (op.type == OpType::GET) {
-      auto result = batcher.get_sync(op.key[0]);
+      [[maybe_unused]] auto result = batcher.get_sync(op.key[0]);
     } else {
       tx_batch.clear(); // O(1) clear, resets size but keeps capacity
       int num_unique = (op.type == OpType::PUT) ? 1 : std::min(3, key_range);
@@ -181,16 +182,34 @@ int main(int argc, char** argv) {
     size_t total_peers = cluster_map.size() - 1;
     size_t num_locks = total_peers * num_threads * 4;
 
-    // Pass nullptr for the IConsensusEngine
     StaticClusterDHTNode node(cluster_map, self_config, key_range * 2, num_locks, replication_degree);
+    IConsensusEngine* consensus = node.get_consensus_engine();
+    
+    node.start();
+    if (consensus) {
+      consensus->start(); 
+    }
 
-    node.start(); 
     node.warmup_network(num_threads);
     node.wait_for_barrier();
 
+    // Wait for the cluster to elect a leader
     #ifndef NDEBUG
       if (node_id == 0) {
-        std::cout << "[TestApp] Barrier passed. Preparing workload (" << total_num_ops << " ops)...\n";
+        std::cout << "[TestApp] Waiting for Leader Election...\n";
+      }
+    #endif
+
+    if (consensus) {
+      while (consensus->get_leader_id() == -1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+    }
+
+    #ifndef NDEBUG
+      if (node_id == 0) {
+        std::cout << "[TestApp] Leader Elected (Node " << consensus->get_leader_id() 
+                  << "). Preparing workload (" << total_num_ops << " ops)...\n";
       }
     #endif
 
@@ -229,7 +248,8 @@ int main(int argc, char** argv) {
     node.wait_for_exit_barrier();
 
     std::cout << "[TestApp] Exit barrier cleared. Stopping node..." << std::endl;
-    node.stop();
+    
+    node.stop(); // Consensus stopeed inside node
 
     // Metrics calculation
     std::chrono::duration<double> total_wall_time = latest_end- global_start;
@@ -282,6 +302,8 @@ int main(int argc, char** argv) {
     std::cout << "  Average TX Latency:       " << std::fixed << std::setprecision(2) << avg_latency_us << " us\n";
     std::cout << "  Storage Throughput:       " << std::fixed << std::setprecision(2) << storage_iops << " IOPS\n";
     std::cout << "  Server Goodput:           " << std::fixed << std::setprecision(2) << server_goodput_iops << " IOPS\n\n";
+    std::cout << "  Transaction Abort Rate:   " << std::fixed << std::setprecision(2) << abort_rate << " %\n";
+    std::cout << "  Total Network Failures:   " << total_network_failures << "\n\n";
 
     std::cout << "[TestApp] Shutdown complete." << std::endl;
 

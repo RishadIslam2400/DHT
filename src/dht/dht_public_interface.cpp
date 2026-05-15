@@ -12,13 +12,13 @@ StaticClusterDHTNode::StaticClusterDHTNode(
   int rep_deg)
   : cluster_map{std::move(map)}, 
     self_config{std::move(self)},
-    storage{hash_table_size, num_locks},
     replication_degree{rep_deg},
-    server_fd{-1},
+    storage{static_cast<int>(hash_table_size), static_cast<int>(num_locks)},
     running{false},
+    server_fd{-1},
     connection_pool(map.empty() ? 0 : map.size()), 
     benchmark_ready{false},
-    thread_pool({1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15}) // 14 pinned threads
+    thread_pool({1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15}) // 14 Pinned threads
 {
   size_t target_stripes = std::min(2 * hash_table_size, static_cast<size_t>(4096));
   num_logical_stripes = std::bit_ceil(std::max<size_t>(1, target_stripes)); 

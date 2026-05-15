@@ -3,14 +3,14 @@
 
 #include "common/utils.h"
 
-inline void log_error(const char *prefix, int err) {
+void log_error(const char *prefix, int err) {
   char buf[1024];
   std::cerr << "[Error] " << prefix << " " 
             << strerror_r(err, buf, sizeof(buf))
             << std::endl;
 }
 
-inline void pin_thread_to_control_cores(std::thread& target_thread) {
+void pin_thread_to_control_cores(std::thread& target_thread) {
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   
