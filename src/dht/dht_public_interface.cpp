@@ -16,7 +16,7 @@ StaticClusterDHTNode::StaticClusterDHTNode(
     storage{static_cast<int>(hash_table_size), static_cast<int>(num_locks)},
     running{false},
     server_fd{-1},
-    connection_pool(map.empty() ? 0 : map.size()), 
+    connection_pool(cluster_map.size()), 
     benchmark_ready{false},
     thread_pool({1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15}) // 14 Pinned threads
 {

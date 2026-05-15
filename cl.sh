@@ -41,7 +41,7 @@ EOF
 # Generate Property File
 function generate_cluster_config() {
   OUTPUT_FILE="config.txt"
-  DEFAULT_PORT=6008
+  DEFAULT_PORT=1895
   
   echo "Generating cluster configuration: $OUTPUT_FILE"
   
