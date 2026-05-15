@@ -18,6 +18,9 @@ struct RaftLogEntry {
   size_t data_size;
 };
 
+// Forward declaration
+struct NodeStats;
+
 class RaftEngine : public IConsensusEngine {
 private:
   INetworkTransport *transport;

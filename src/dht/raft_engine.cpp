@@ -1,6 +1,7 @@
 #include "dht/raft_engine.h"
 #include "common/utils.h"
 #include "dht/dht_static_partitioning.h"
+#include "dht/node_properties.h"
 
 #include <iostream>
 #include <algorithm>
