@@ -22,7 +22,6 @@ struct NodeStats {
   alignas(64) std::atomic<uint32_t> local_gets_not_found{0};
 
   // Operation latencies
-  alignas(64) std::atomic<uint64_t> remote_puts_total_ns{0};
   alignas(64) std::atomic<uint64_t> remote_gets_total_ns{0};
 
   // Remote Network Metrics
@@ -68,7 +67,7 @@ struct TelemetryBatcher {
   uint32_t local_found = 0, local_not_found = 0;
   
   // Remote RPC Metrics
-  uint64_t remote_put_ns = 0; uint32_t remote_put_success = 0, remote_put_failed = 0;
+  uint32_t remote_put_success = 0, remote_put_failed = 0;
   uint64_t remote_get_ns = 0; uint32_t remote_get_success = 0, remote_get_failed = 0;
 
   // 2PC Cohort Metrics
@@ -77,7 +76,7 @@ struct TelemetryBatcher {
   uint64_t tx_abort_ns = 0;   uint32_t local_tx_aborted = 0;
 
   // 2PC Coordinator Metrics
-  uint64_t coord_tx_ns = 0, coord_prepare_ns = 0, coord_phase2_commit_ns = 0;
+  uint64_t coord_prepare_ns = 0, coord_phase2_commit_ns = 0;
   uint32_t coord_prepare_success = 0;
   uint32_t coord_tx_committed = 0, coord_tx_failed = 0;
   uint32_t coord_tx_retries = 0, coord_phase2_retries = 0;
@@ -106,7 +105,6 @@ struct TelemetryBatcher {
 
   void flush_remote_puts() {
     if (!stats) return;
-    if (remote_put_ns > 0)      stats->remote_puts_total_ns.fetch_add(remote_put_ns, std::memory_order_relaxed);
     if (remote_put_success > 0) stats->remote_puts_success.fetch_add(remote_put_success, std::memory_order_relaxed);
     if (remote_put_failed > 0)  stats->remote_puts_failed.fetch_add(remote_put_failed, std::memory_order_relaxed);
   }
@@ -136,7 +134,6 @@ struct TelemetryBatcher {
     if (coord_tx_retries > 0)       stats->coordinator_tx_retries.fetch_add(coord_tx_retries, std::memory_order_relaxed);
     if (coord_tx_failed > 0)        stats->coordinator_tx_failed.fetch_add(coord_tx_failed, std::memory_order_relaxed);
     if (coord_phase2_retries > 0)   stats->coordinator_phase2_retries.fetch_add(coord_phase2_retries, std::memory_order_relaxed);
-    if (coord_tx_ns > 0)            stats->coordinator_tx_total_ns.fetch_add(coord_tx_ns, std::memory_order_relaxed);    
     if (coord_prepare_ns > 0)       stats->coordinator_prepare_total_ns.fetch_add(coord_prepare_ns, std::memory_order_relaxed);
     if (coord_phase2_commit_ns > 0) stats->coordinator_phase2_commit_ns.fetch_add(coord_phase2_commit_ns, std::memory_order_relaxed);
   }

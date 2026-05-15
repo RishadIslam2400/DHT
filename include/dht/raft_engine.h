@@ -22,6 +22,7 @@ class RaftEngine : public IConsensusEngine {
 private:
   INetworkTransport *transport;
   IStateMachine *state_machine;
+  NodeStats* stats;
 
   // Cached Topology
   std::vector<int> peer_ids;
@@ -101,7 +102,7 @@ private:
   void dispatch_vote_reply(uint32_t target_id, const RaftVoteReplyHeader& reply);
 
 public:
-  explicit RaftEngine(INetworkTransport* nt, IStateMachine* sm);
+  explicit RaftEngine(INetworkTransport* nt, IStateMachine* sm, NodeStats* node_stats);
   ~RaftEngine() override;
 
   // IConsensusEngine interface

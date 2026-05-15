@@ -47,7 +47,7 @@ StaticClusterDHTNode::StaticClusterDHTNode(
     }
   }
 
-  this->consensus_engine = std::make_unique<RaftEngine>(this, this);
+  this->consensus_engine = std::make_unique<RaftEngine>(this, this, &stats);
 
   std::cout << "Booted Node " << self_config.id
             << " (" << self_config.ip << ":" << self_config.port << ")" << std::endl;
@@ -214,7 +214,7 @@ void StaticClusterDHTNode::wait_for_exit_barrier() {
 
   // Dead peer safety timeout
   auto start_time = std::chrono::steady_clock::now();
-  const auto MAX_WAIT = std::chrono::seconds(30);
+  const auto MAX_WAIT = std::chrono::seconds(150);
 
   // Continuously notify missing peers while waiting
   while (true) {
@@ -280,13 +280,14 @@ void StaticClusterDHTNode::print_status() {
   // 2PC Coordinator
   uint32_t coord_tx_commit = stats.coordinator_tx_committed.load(std::memory_order_relaxed);
   uint32_t coord_tx_fail   = stats.coordinator_tx_failed.load(std::memory_order_relaxed);
+  uint32_t coord_total_tx = coord_tx_commit + coord_tx_fail;
 
   // 2PC Cohort
   uint32_t local_commits = stats.local_tx_committed.load(std::memory_order_relaxed);
   uint32_t local_aborts  = stats.local_tx_aborted.load(std::memory_order_relaxed);
   uint32_t rejected_locked = stats.tx_prepare_rejected_locked.load(std::memory_order_relaxed);
   uint32_t rejected_obsolete = stats.tx_prepare_rejected_obsolete.load(std::memory_order_relaxed);
-  uint32_t total_prepares = local_commits + local_aborts + rejected_locked + rejected_obsolete;
+  uint32_t local_total_tx = local_commits + local_aborts + rejected_locked + rejected_obsolete;
 
   // Aggregate Totals
   uint32_t total_local_puts = puts_inserted + puts_updated + puts_dropped;
@@ -297,11 +298,10 @@ void StaticClusterDHTNode::print_status() {
       return count > 0 ? (static_cast<double>(total_ns) / count) / 1000.0 : 0.0;
   };
 
-  double avg_remote_put_us  = calc_avg_us(stats.remote_puts_total_ns.load(std::memory_order_relaxed), remote_put_ok);
   double avg_remote_get_us  = calc_avg_us(stats.remote_gets_total_ns.load(std::memory_order_relaxed), remote_get_ok);
   
-  double avg_coord_tx_us    = calc_avg_us(stats.coordinator_tx_total_ns.load(std::memory_order_relaxed), coord_tx_commit);
-  double avg_tx_prepare_us  = calc_avg_us(stats.local_tx_prepare_total_ns.load(std::memory_order_relaxed), total_prepares);
+  double avg_coord_tx_us    = calc_avg_us(stats.coordinator_tx_total_ns.load(std::memory_order_relaxed), coord_total_tx);
+  double avg_tx_prepare_us  = calc_avg_us(stats.local_tx_prepare_total_ns.load(std::memory_order_relaxed), local_total_tx);
   double avg_tx_commit_us   = calc_avg_us(stats.local_tx_commit_total_ns.load(std::memory_order_relaxed), local_commits);
   double avg_tx_abort_us    = calc_avg_us(stats.local_tx_abort_total_ns.load(std::memory_order_relaxed), local_aborts);
 
@@ -324,7 +324,6 @@ void StaticClusterDHTNode::print_status() {
   std::cout << "  Remote PUT Requests:\n";
   std::cout << "    - Success:                " << remote_put_ok << "\n";
   std::cout << "    - Failed:                 " << remote_put_fail << "\n";
-  std::cout << "    - Avg Latency:            " << avg_remote_put_us << " us\n\n";
 
   std::cout << "  Remote GET Requests:\n";
   std::cout << "    - Success:                " << remote_get_ok << "\n";

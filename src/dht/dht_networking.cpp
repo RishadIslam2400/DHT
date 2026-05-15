@@ -579,7 +579,9 @@ RpcResult StaticClusterDHTNode::perform_rpc_single_request(
   // Process the fixed-length response (if expected)
   if (response_size > 0) {
     if (!recv_n_bytes(sock, response, response_size)) {
-      log_error("Error receiving response from single request", errno);
+      if (errno != ECONNRESET && errno != EPIPE && errno != ETIMEDOUT) {
+        log_error("Error receiving response from single request", errno);
+      }
       return RpcResult::RecvFailed; // Unsafe to retry
     }
   }

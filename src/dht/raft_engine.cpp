@@ -8,8 +8,8 @@
 #include <functional>
 
 // Constructor
-RaftEngine::RaftEngine(INetworkTransport* nt, IStateMachine* sm)
-: transport(nt), state_machine(sm)
+RaftEngine::RaftEngine(INetworkTransport* nt, IStateMachine* sm, NodeStats* node_stats)
+: transport(nt), state_machine(sm), stats(node_stats)
 { 
   // Cahce the network topology
   peer_ids = transport->get_peer_ids();
@@ -635,6 +635,12 @@ void RaftEngine::handle_append_entries(uint32_t sender_id, const uint8_t* payloa
     // Follower has corrupted/uncommitted logs from an old split vote election.
     // Delete this index and all indexes that follow it.
 
+    // Calculate exactly how many logs we are throwing away
+    size_t dropped_logs = log.size() - header->prev_log_index;
+    if (stats) {
+      stats->consensus_log_truncations.fetch_add(dropped_logs, std::memory_order_relaxed);
+    }
+
     truncate_log(header->prev_log_index);
 
     // Reject the packet so the Leader decrements next_index and probes backward
@@ -646,6 +652,7 @@ void RaftEngine::handle_append_entries(uint32_t sender_id, const uint8_t* payloa
   // Read after the append entries header
   const uint8_t* read_ptr = payload + sizeof(RaftAppendEntriesHeader);
   size_t bytes_remaining = size - sizeof(RaftAppendEntriesHeader);
+  uint32_t appended_this_batch = 0;
 
   for (uint16_t i = 0; i < header->batch_size; ++i) {
     if (bytes_remaining < sizeof(RaftSerializedLogHeader)) [[unlikely]]
@@ -670,7 +677,11 @@ void RaftEngine::handle_append_entries(uint32_t sender_id, const uint8_t* payloa
       } else {
         // An uncommitted log exists here with a different term
         // Truncate the local log from this point forward to match the current leader
-        truncate_log(log[target_idx].data_offset);
+        size_t dropped_logs = log.size() - target_idx;
+        if (stats) {
+          stats->consensus_log_truncations.fetch_add(dropped_logs, std::memory_order_relaxed);
+        }
+        truncate_log(target_idx);
       }
     }
 
@@ -685,10 +696,15 @@ void RaftEngine::handle_append_entries(uint32_t sender_id, const uint8_t* payloa
     }
 
     log.push_back(new_entry);
+    appended_this_batch++;
 
     // Advance the pointer for next iteration
     read_ptr += s_header->payload_size;
     bytes_remaining -= s_header->payload_size;
+  }
+
+  if (appended_this_batch > 0 && stats) {
+    stats->consensus_log_entries_appended.fetch_add(appended_this_batch, std::memory_order_relaxed);
   }
 
   // Advance commit index

@@ -38,6 +38,7 @@ struct Phase1Quorum {
 
 // Client API
 TransactionResult DHTTransactionManager::execute_transaction(const std::vector<std::pair<uint32_t, uint32_t>>& kv_pairs) {
+  auto e2e_start = std::chrono::high_resolution_clock::now();
   if (kv_pairs.empty()) [[unlikely]]
     return TransactionResult::Committed;
 
@@ -170,6 +171,12 @@ TransactionResult DHTTransactionManager::execute_transaction(const std::vector<s
          dht_node.send_tx_commit(target_id, tx_ts, local_batcher);
       });
     }
+
+    auto e2e_end = std::chrono::high_resolution_clock::now();
+    dht_node.stats.coordinator_tx_total_ns.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(e2e_end - e2e_start).count(), 
+      std::memory_order_relaxed
+    );
     return TransactionResult::Committed;
   }
 
@@ -187,6 +194,12 @@ TransactionResult DHTTransactionManager::execute_transaction(const std::vector<s
 
     dht_node.enqueue_for_async_recovery(target_id, TwoPhaseCommitCommand::Abort, tx_ts);
   }
+
+  auto e2e_end = std::chrono::high_resolution_clock::now();
+  dht_node.stats.coordinator_tx_total_ns.fetch_add(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(e2e_end - e2e_start).count(), 
+    std::memory_order_relaxed
+  );
 
   return TransactionResult::Aborted;
 }
